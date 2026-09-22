@@ -16,14 +16,12 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
-import secrets
 import socketserver
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
-
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 16 * 1024
@@ -129,7 +127,10 @@ class Supervisor:
         self.compose_file = self.project / "compose.ai.yml"
         self.renderer = self.project / "llama-cpp" / "render-compose.py"
         if not self.compose_file.is_file() or not self.renderer.is_file():
-            raise ValueError(f"project does not contain compose.ai.yml and llama-cpp/render-compose.py: {self.project}")
+            raise ValueError(
+                "project does not contain compose.ai.yml and "
+                f"llama-cpp/render-compose.py: {self.project}"
+            )
 
     def execute(self, action: str, service: str) -> dict[str, Any]:
         profile = resolve_profile(self.project, service)
@@ -139,8 +140,7 @@ class Supervisor:
             command,
             cwd=self.project,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         return {
@@ -157,8 +157,7 @@ class Supervisor:
             [sys.executable, os.fspath(self.renderer), os.fspath(profile)],
             cwd=self.project,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         if result.returncode:
@@ -172,9 +171,12 @@ class Supervisor:
 
     def _compose_command(self, action: str, service: str, rendered: Path) -> list[str]:
         command = [
-            "docker", "compose",
-            "-f", os.fspath(self.compose_file),
-            "-f", os.fspath(rendered),
+            "docker",
+            "compose",
+            "-f",
+            os.fspath(self.compose_file),
+            "-f",
+            os.fspath(rendered),
         ]
         actions = {
             "up": ["up", "-d", "--build", "--no-deps", service],
@@ -209,19 +211,32 @@ class ControlHandler(socketserver.StreamRequestHandler):
             self.server.authorizer.verify(message)  # type: ignore[attr-defined]
             result = self.server.supervisor.execute(message["action"], message["service"])  # type: ignore[attr-defined]
             self._respond({"ok": result["exit_code"] == 0, "id": message["id"], "result": result})
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError, RequestError, RuntimeError, ValueError) as error:
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+            RequestError,
+            RuntimeError,
+            ValueError,
+        ) as error:
             self._respond({"ok": False, "error": str(error)})
 
     def _respond(self, response: dict[str, Any]) -> None:
-        self.wfile.write(json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n")
+        self.wfile.write(
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
+        )
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path, required=True, help="repository containing compose.ai.yml")
+    parser.add_argument(
+        "--project", type=Path, required=True, help="repository containing compose.ai.yml"
+    )
     parser.add_argument("--socket", type=Path, required=True, help="Unix socket path to create")
     parser.add_argument("--secret", type=Path, required=True, help="read-only HMAC secret file")
-    parser.add_argument("--socket-group", required=True, help="group permitted to connect to the socket")
+    parser.add_argument(
+        "--socket-group", required=True, help="group permitted to connect to the socket"
+    )
     return parser.parse_args()
 
 
@@ -245,7 +260,7 @@ def main() -> int:
         group_id = prepare_socket(arguments.socket, arguments.socket_group)
         supervisor = Supervisor(arguments.project)
         authorizer = Authorizer(arguments.secret.read_bytes())
-        server = ControlServer(os.fspath(arguments.socket), supervisor, authorizer)
+        server = ControlServer(str(arguments.socket), supervisor, authorizer)
         if arguments.socket.stat().st_gid != group_id:
             os.chown(arguments.socket, -1, group_id)
         os.chmod(arguments.socket, 0o660)

@@ -1,1 +1,15 @@
-*.pyc
+# Python bytecode, virtual environments, and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.ruff_cache/
+.pyright/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration and credentials (commit an explicitly safe example only)
+.env
+.env.*
+!.env.example

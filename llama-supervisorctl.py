@@ -7,12 +7,11 @@ import argparse
 import hashlib
 import hmac
 import json
-from pathlib import Path
 import secrets
 import socket
 import sys
 import time
-
+from pathlib import Path
 
 PROTOCOL_VERSION = 1
 ACTIONS = ("up", "start", "stop", "restart", "rm", "ps")
@@ -24,7 +23,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("service", help="literal approved SERVICE_NAME")
     parser.add_argument("--socket", type=Path, default=Path("/run/llama-supervisor/control.sock"))
     parser.add_argument("--secret", type=Path, default=Path("/etc/llama-supervisor/broker.hmac"))
-    parser.add_argument("--timeout", type=float, default=300, help="seconds to wait for a Compose operation")
+    parser.add_argument(
+        "--timeout", type=float, default=300, help="seconds to wait for a Compose operation"
+    )
     return parser.parse_args()
 
 
@@ -44,10 +45,15 @@ def main() -> int:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(arguments.timeout)
         client.connect(str(arguments.socket))
-        client.sendall(json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n")
+        client.sendall(
+            json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
+        )
         response = client.makefile("rb").readline()
     if not response:
-        print("llama-supervisorctl.py: supervisor closed the connection without a response", file=sys.stderr)
+        print(
+            "llama-supervisorctl.py: supervisor closed the connection without a response",
+            file=sys.stderr,
+        )
         return 2
     payload = json.loads(response)
     print(json.dumps(payload, indent=2, sort_keys=True))
