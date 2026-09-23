@@ -31,6 +31,11 @@ docstring-code-format = true
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
-include = ["src", "tests", "llama-supervisor.py", "llama-supervisorctl.py"]
+include = [
+    "src",
+    "tests",
+    "model-broker-host-facts.py",
+    "model-broker-host-factsctl.py",
+]
 exclude = [".venv", ".git"]
 reportMissingTypeStubs = "none"

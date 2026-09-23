@@ -1,73 +1,86 @@
 # Model broker scaffolding
 
-## Llama supervisor
+## Model-broker host facts
 
-`llama-supervisor.py` is a host-side executor for the existing rendered
-llama.cpp Compose profiles. It is deliberately not a scheduler: it has no GPU
-or RAM logic, does not inspect NVML, and does not decide whether a service is
-safe to evict. The future broker makes those decisions and sends one of the
-bounded actions `up`, `start`, `stop`, `restart`, `rm`, or `ps` for one literal
-`SERVICE_NAME`.
+`model-broker-host-facts.py` is the optional, root-owned observation helper
+described in [the design](design.md). It is not a supervisor: it does not use
+Docker or Compose, start or stop applications, read model configuration, make
+scheduling decisions, or expose a model API.
 
-Each request is JSON over a Unix-domain socket and has a timestamp, unique
-nonce, and HMAC-SHA-256. The supervisor only resolves service names found in
-`llama-cpp/config/*/*.env`, renders that selected profile with
-`render-compose.py`, and runs the corresponding fixed `docker compose`
-arguments. It never accepts Compose paths, env files, Docker options, images,
-or commands from its client.
+The helper exposes one Unix-domain socket at
+`/run/model-broker-host-facts/facts.sock`. Its deliberately small, versioned
+JSON protocol accepts exactly these requests:
 
-The socket and HMAC secret are the control boundary:
+| Request | Returned data |
+| --- | --- |
+| `inventory` | CPU/RAM/NUMA inventory plus CUDA-to-kernel-device and PCIe facts when NVIDIA's libraries are available. |
+| `utilisation` | Timestamped CPU and host-memory use, plus NVIDIA GPU and memory utilisation when available. |
 
-- The socket has no TCP listener and is mode `0660` for the dedicated
-  `llama-supervisor-client` group.
-- Only the broker container should receive the socket and secret mounts.
-- A deliberate local administrator/test account can use the control client by
-  joining that group (or by using `sudo`); ordinary containers cannot reach a
-  Unix socket merely by sharing a Docker network.
-- The supervisor itself runs as a separate unprivileged account, but Docker
-  access remains host-root-equivalent. The installed executable and unit are
-  root-owned, but the supervisor deliberately reads the configured repository's
-  renderer and profile files. Treat write access to that repository as
-  administrative authority and do not mount it writable into untrusted
-  containers.
+Every request must have exactly `version`, `id`, and `request` fields. A
+successful response includes the same `id`, protocol version, and structured
+`result`. The service does not execute supplied commands or return arbitrary
+host output. NVIDIA information is obtained directly through NVML and the
+CUDA driver API; it never shells out to `nvidia-smi`.
 
-Install manually on the host after reviewing the paths and service account:
+Socket access is the control boundary. The socket is owned by root and the
+dedicated `model-broker-host-facts-client` group with mode `0660`; the service
+also checks Linux peer credentials (including supplementary groups) for each
+connection. Mount only this socket into the broker container. There is no
+HMAC key or Docker socket to mount.
+
+Install manually on the host after reviewing the unit:
 
 ```sh
-sudo ./model-broker/install-llama-supervisor.sh
-sudo systemctl status llama-supervisor
+sudo ./install-model-broker-host-facts.sh
+sudo systemctl status model-broker-host-facts
 ```
 
-The installer creates `/etc/llama-supervisor/environment` once. Edit it to use
-a different repository path before starting the service. It prints the numeric
-group ID required by the broker container.
+When present, the installer disables and stops the legacy
+`llama-supervisor.service`, so it can no longer control Compose workloads. It
+does not remove the old unit or its credentials; review and remove those
+legacy files separately when appropriate.
 
-The future broker Compose service needs these mounts and group membership:
+The installer prints the numeric group ID to add to the broker container. A
+deployment that enables optional host facts should use:
 
 ```yaml
 group_add:
-  - "${LLAMA_SUPERVISOR_CLIENT_GID}"
+  - "${MODEL_BROKER_HOST_FACTS_GID}"
 volumes:
-  - /run/llama-supervisor/control.sock:/run/llama-supervisor/control.sock
-  - /etc/llama-supervisor/broker.hmac:/run/secrets/llama-supervisor.hmac:ro
+  - /run/model-broker-host-facts/facts.sock:/run/model-broker-host-facts/facts.sock
 environment:
-  LLAMA_SUPERVISOR_SOCKET: /run/llama-supervisor/control.sock
-  LLAMA_SUPERVISOR_SECRET: /run/secrets/llama-supervisor.hmac
+  MODEL_BROKER_HOST_FACTS_SOCKET: /run/model-broker-host-facts/facts.sock
 ```
 
-Use the installed control client for intentional host-side testing. It needs
-the secret, so invoke it with `sudo` unless a dedicated test principal has
-been granted access:
+For an intentional host-side check (normally through `sudo`):
 
 ```sh
-sudo /usr/local/libexec/llama-supervisor/llama-supervisorctl.py \
-  ps llama-cpp-gpu-0
-sudo /usr/local/libexec/llama-supervisor/llama-supervisorctl.py \
-  up llama-cpp-gpu-0
-sudo /usr/local/libexec/llama-supervisor/llama-supervisorctl.py \
-  stop llama-cpp-gpu-0
+sudo /usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py inventory
+sudo /usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py utilisation
 ```
 
-`stop` releases a running llama process and therefore its lifetime GPU lock.
-`rm` is intentionally separate. No operation runs project-wide `docker compose
-down`.
+The first `utilisation` response reports `cpu.sample_ready: false`, because it
+establishes the CPU baseline. Later samples return CPU percentage. NVIDIA or
+hardware-interface fields can be unavailable; the broker must preserve that
+as unknown rather than infer it.
+
+## Tests
+
+The normal suite needs no Docker:
+
+```sh
+pytest -q
+```
+
+The systemd installation and migration test is deliberately opt-in. It uses a
+privileged, network-isolated `docker run` container and never uses Docker
+Compose. Build its small local image first, then run the test:
+
+```sh
+docker build --file tests/systemd/Dockerfile --tag model-broker-systemd-test:local tests
+MODEL_BROKER_RUN_SYSTEMD_INTEGRATION=1 pytest -q tests/test_systemd_integration.py
+```
+
+The integration test creates a legacy `llama-supervisor.service`, runs the
+installer, verifies that the legacy service is stopped and disabled, verifies
+the new socket ownership and mode, and makes an `inventory` request.

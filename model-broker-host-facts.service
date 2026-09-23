@@ -1,0 +1,29 @@
+[Unit]
+Description=Read-only hardware facts service for model-broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=model-broker-host-facts
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/libexec/model-broker-host-facts/model-broker-host-facts.py --socket /run/model-broker-host-facts/facts.sock --socket-group model-broker-host-facts-client
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadOnlyPaths=/proc /sys
+ReadWritePaths=/run/model-broker-host-facts
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
