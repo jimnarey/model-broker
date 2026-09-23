@@ -1,26 +1,31 @@
-"""FastAPI entry point and safe OpenAPI-derived placeholder routes for model-broker."""
+"""FastAPI entry point and safe OpenAPI-derived placeholder routes for model-broker.
+
+Run with ``uvicorn --factory model_broker.application:create_app``.
+"""
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import cast
-from urllib.error import URLError
-from urllib.request import Request as UrlRequest
-from urllib.request import urlopen
 
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.routing import BaseRoute, Route
 
 LOGGER = logging.getLogger(__name__)
 OPENAPI_PATH = "/openapi.json"
 HTTP_METHODS = frozenset({"delete", "get", "head", "options", "patch", "post", "put", "trace"})
 JsonObject = dict[str, object]
+RouterOperation = tuple[str, str, JsonObject]
+
+
+class RouterSchemaError(ValueError):
+    """The router OpenAPI document could not be fetched or is unusable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,147 +49,160 @@ class Settings:
         return cls(llama_url=llama_url.rstrip("/"), openapi_timeout_seconds=timeout)
 
 
-RouterSchemaFetcher = Callable[[Settings], JsonObject]
-
-
 @dataclass(slots=True)
 class RouterSchemaStatus:
-    """The latest startup attempt to obtain the private router schema."""
+    """The startup attempt to obtain the private router schema."""
 
     available: bool = False
     error: str | None = None
     generated_operations: int = 0
 
 
-def fetch_router_openapi(settings: Settings) -> JsonObject:
-    """Download and validate the router OpenAPI document with a bounded timeout."""
-    request = UrlRequest(
-        f"{settings.llama_url}{OPENAPI_PATH}",
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
+RouterSchemaFetcher = Callable[[Settings], Awaitable[object]]
+
+
+async def fetch_router_openapi(
+    settings: Settings, transport: httpx.AsyncBaseTransport | None = None
+) -> object:
+    """Download the router OpenAPI document with a bounded timeout."""
     try:
-        with urlopen(request, timeout=settings.openapi_timeout_seconds) as response:
-            decoded: object = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, URLError) as error:
-        raise RuntimeError(f"could not fetch router OpenAPI document: {error}") from error
-    if not isinstance(decoded, dict):
-        raise ValueError("router OpenAPI document must be a JSON object")
-    document = cast(JsonObject, decoded)
-    if not isinstance(document.get("paths"), dict):
-        raise ValueError("router OpenAPI document has no paths object")
-    return document
+        async with httpx.AsyncClient(
+            transport=transport, timeout=settings.openapi_timeout_seconds
+        ) as client:
+            response = await client.get(
+                f"{settings.llama_url}{OPENAPI_PATH}", headers={"Accept": "application/json"}
+            )
+            response.raise_for_status()
+            return cast(object, response.json())
+    except (httpx.HTTPError, ValueError) as error:
+        raise RouterSchemaError(f"could not fetch router OpenAPI document: {error}") from error
 
 
-def openai_error(message: str, code: str) -> dict[str, object]:
-    """Return the stable error shape used by broker-owned placeholder endpoints."""
-    return {"error": {"message": message, "type": "not_implemented", "code": code}}
+def router_operations(document: object) -> list[RouterOperation]:
+    """Validate the whole document and return each (path, method, operation) it declares.
 
-
-def route_operations(app: FastAPI) -> set[tuple[str, str]]:
-    """Return the path and HTTP-method pairs already owned by the broker."""
-    operations: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = getattr(route, "methods", None)
-        path = getattr(route, "path", None)
-        if isinstance(path, str) and methods is not None:
-            operations.update((path, method.lower()) for method in methods)
+    Validation finishes before anything is registered, so a malformed entry cannot leave the
+    broker with only some of the router's operations.
+    """
+    paths = cast(JsonObject, document).get("paths") if isinstance(document, dict) else None
+    if not isinstance(paths, dict):
+        raise RouterSchemaError("router OpenAPI document has no paths object")
+    operations: list[RouterOperation] = []
+    for path, path_item in cast(JsonObject, paths).items():
+        if not path.startswith("/"):
+            raise RouterSchemaError(f"router OpenAPI path {path!r} must start with a slash")
+        if not isinstance(path_item, dict):
+            raise RouterSchemaError(f"router OpenAPI path item for {path!r} must be an object")
+        # Path items also hold non-operation keys such as "parameters" and "summary".
+        for method, operation in cast(JsonObject, path_item).items():
+            if method.lower() not in HTTP_METHODS:
+                continue
+            if not isinstance(operation, dict):
+                raise RouterSchemaError(
+                    f"router OpenAPI operation for {method.upper()} {path} must be an object"
+                )
+            operations.append((path, method.lower(), cast(JsonObject, operation)))
     return operations
 
 
-def placeholder_endpoint(path: str, method: str) -> Callable[[Request], Awaitable[JSONResponse]]:
-    """Build one endpoint that advertises an upstream operation without proxying it."""
+def not_implemented(message: str, code: str) -> JSONResponse:
+    """Return a 501 response in the OpenAI error shape."""
+    error = {"message": message, "type": "not_implemented", "code": code}
+    return JSONResponse(status_code=501, content={"error": error})
 
-    async def endpoint(_: Request) -> JSONResponse:
-        return JSONResponse(
-            status_code=501,
-            content=openai_error(
-                " ".join(
-                    (
-                        f"{method.upper()} {path} is declared by the upstream router",
-                        "but is not implemented by model-broker.",
-                    )
-                ),
-                "not_implemented",
-            ),
-        )
 
-    endpoint.__name__ = (
-        f"generated_{method}_{path.strip('/').replace('/', '_').replace('{', '').replace('}', '')}"
+def placeholder_endpoint(path: str, method: str) -> Callable[[], Awaitable[JSONResponse]]:
+    """Build an endpoint that advertises an upstream operation without proxying it."""
+    message = (
+        f"{method.upper()} {path} is declared by the upstream router "
+        "but is not implemented by model-broker."
     )
+
+    async def endpoint() -> JSONResponse:
+        return not_implemented(message, "not_implemented")
+
     return endpoint
 
 
-def register_router_placeholders(app: FastAPI, document: JsonObject) -> int:
-    """Register one 501 route for each upstream operation not explicitly broker-owned."""
-    raw_paths = document["paths"]
-    if not isinstance(raw_paths, dict):
-        raise ValueError("router OpenAPI document has no paths object")
-    paths = cast(JsonObject, raw_paths)
-    existing = route_operations(app)
-    generated = 0
-    for path, raw_path_item in paths.items():
-        if not path.startswith("/"):
-            raise ValueError("router OpenAPI path names must start with a slash")
-        if not isinstance(raw_path_item, dict):
-            raise ValueError(f"router OpenAPI path item for {path!r} must be an object")
-        path_item = cast(JsonObject, raw_path_item)
-        for method, raw_operation in path_item.items():
-            if method.lower() not in HTTP_METHODS:
-                continue
-            normalised_method = method.lower()
-            if not isinstance(raw_operation, dict):
-                raise ValueError(
-                    f"router OpenAPI operation for {method.upper()} {path} must be an object"
-                )
-            if (path, normalised_method) in existing:
-                continue
-            operation = cast(JsonObject, raw_operation)
-            operation_id = operation.get("operationId")
-            summary = operation.get("summary")
-            description = operation.get("description")
-            app.add_api_route(
-                path,
-                placeholder_endpoint(path, normalised_method),
-                methods=[normalised_method.upper()],
-                status_code=501,
-                operation_id=operation_id if isinstance(operation_id, str) else None,
-                summary=summary if isinstance(summary, str) else None,
-                description=description if isinstance(description, str) else None,
-                responses={
-                    501: {
-                        "description": "The broker does not implement this upstream operation yet."
-                    }
-                },
-            )
-            existing.add((path, normalised_method))
-            generated += 1
+def optional_text(operation: JsonObject, key: str) -> str | None:
+    value = operation.get(key)
+    return value if isinstance(value, str) else None
+
+
+def served_operations(routes: Iterable[BaseRoute]) -> set[tuple[str, str]]:
+    return {
+        (route.path, method.lower())
+        for route in routes
+        if isinstance(route, Route)
+        for method in route.methods or ()
+    }
+
+
+def register_placeholders(app: FastAPI, operations: list[RouterOperation]) -> int:
+    """Register a 501 route for each operation the broker does not already own."""
+    # FastAPI keeps an included router as one opaque entry in app.routes, so the broker's
+    # own routes are read from the router itself; app.routes adds /openapi.json and /docs.
+    owned = served_operations(app.routes) | served_operations(router.routes)
+    new = [(path, method, op) for path, method, op in operations if (path, method) not in owned]
+    for path, method, operation in new:
+        app.add_api_route(
+            path,
+            placeholder_endpoint(path, method),
+            methods=[method.upper()],
+            status_code=501,
+            operation_id=optional_text(operation, "operationId"),
+            summary=optional_text(operation, "summary"),
+            description=optional_text(operation, "description"),
+            responses={501: {"description": "The broker does not implement this operation yet."}},
+        )
     app.openapi_schema = None
-    return generated
+    return len(new)
+
+
+router = APIRouter(tags=["broker"])
+
+
+@router.get("/health")
+async def health(request: Request) -> JsonObject:
+    """Report broker liveness and whether the router API surface is current."""
+    status = cast(RouterSchemaStatus, request.app.state.router_schema_status)
+    return {"status": "ok", "router_openapi": asdict(status)}
+
+
+@router.post(
+    "/v1/chat/completions",
+    status_code=501,
+    summary="Broker-owned chat-completions override",
+    responses={501: {"description": "Scheduling and proxying are not implemented yet."}},
+)
+async def chat_completions() -> JSONResponse:
+    """Reserve the upstream chat endpoint for future validation, scheduling, and proxying."""
+    return not_implemented(
+        "Chat completions are broker-owned and require scheduling support that is not "
+        "implemented yet.",
+        "broker_scheduling_not_implemented",
+    )
 
 
 def create_app(
     settings: Settings | None = None,
-    schema_fetcher: RouterSchemaFetcher = fetch_router_openapi,
+    fetch_schema: RouterSchemaFetcher = fetch_router_openapi,
 ) -> FastAPI:
     """Create the broker API with explicit endpoints and startup-derived placeholders."""
-    configured_settings = settings or Settings.from_environment()
-    status = RouterSchemaStatus()
+    configured = settings or Settings.from_environment()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        status = cast(RouterSchemaStatus, app.state.router_schema_status)
         try:
-            document = await asyncio.to_thread(schema_fetcher, configured_settings)
-            status.generated_operations = register_router_placeholders(app, document)
-            status.available = True
-            status.error = None
-            LOGGER.info(
-                "registered %s OpenAPI-derived router operations", status.generated_operations
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            status.available = False
+            operations = router_operations(await fetch_schema(configured))
+        except RouterSchemaError as error:
             status.error = str(error)
             LOGGER.warning("router OpenAPI document is unavailable: %s", error)
+        else:
+            status.generated_operations = register_placeholders(app, operations)
+            status.available = True
+            LOGGER.info("registered %s router placeholder operations", status.generated_operations)
         yield
 
     app = FastAPI(
@@ -193,39 +211,6 @@ def create_app(
         description="Broker-owned API surface for scheduled local model inference.",
         lifespan=lifespan,
     )
-    app.state.router_schema_status = status
-
-    @app.get("/health", tags=["broker"])
-    async def health() -> dict[str, object]:
-        """Report broker liveness and whether the router API surface is current."""
-        return {
-            "status": "ok",
-            "router_openapi": {
-                "available": status.available,
-                "error": status.error,
-                "generated_operations": status.generated_operations,
-            },
-        }
-
-    @app.post(
-        "/v1/chat/completions",
-        status_code=501,
-        tags=["broker"],
-        summary="Broker-owned chat-completions override",
-        responses={501: {"description": "Scheduling and proxying are not implemented yet."}},
-    )
-    async def chat_completions(_: Request) -> JSONResponse:
-        """Reserve the upstream chat endpoint for future validation, scheduling, and proxying."""
-        return JSONResponse(
-            status_code=501,
-            content=openai_error(
-                "Chat completions are broker-owned and require scheduling support that is not "
-                "implemented yet.",
-                "broker_scheduling_not_implemented",
-            ),
-        )
-
+    app.state.router_schema_status = RouterSchemaStatus()
+    app.include_router(router)
     return app
-
-
-app = create_app()

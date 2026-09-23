@@ -26,4 +26,4 @@ RUN groupadd --system model-broker \
 USER model-broker
 EXPOSE 8000
 
-CMD ["uvicorn", "model_broker.application:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "--factory", "model_broker.application:create_app", "--host", "0.0.0.0", "--port", "8000"]

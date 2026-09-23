@@ -31,18 +31,17 @@ def main() -> int:
         "id": secrets.token_hex(12),
         "request": arguments.request,
     }
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(arguments.timeout)
-        client.connect(str(arguments.socket))
-        client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
-        response = client.makefile("rb").readline()
-    if not response:
-        print(
-            "model-broker-host-factsctl.py: service closed connection without a response",
-            file=sys.stderr,
-        )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(arguments.timeout)
+            client.connect(str(arguments.socket))
+            client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            response = client.makefile("rb").readline()
+        payload = json.loads(response)
+    except (OSError, ValueError) as error:
+        reason = "no valid response" if isinstance(error, ValueError) else error
+        print(f"model-broker-host-factsctl.py: {arguments.socket}: {reason}", file=sys.stderr)
         return 2
-    payload = json.loads(response)
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0 if payload.get("ok") else 1
 

@@ -20,7 +20,7 @@ the router.
 Run locally with the project environment:
 
 ```sh
-uv run uvicorn model_broker.application:app --host 127.0.0.1 --port 8000
+uv run uvicorn --factory model_broker.application:create_app --host 127.0.0.1 --port 8000
 ```
 
 The supplied [`.env.example`](.env.example) lists the current environment
@@ -34,7 +34,7 @@ this project. It does not mount a Docker socket, host device, or host-facts
 socket.
 
 ```sh
-docker build --tag model-broker-dv:local .
+docker build --tag model-broker-dev:local .
 docker run --rm --publish 8000:8000 \
   --env MODEL_BROKER_LLAMA_URL=http://llama-cpp:8080 \
   model-broker-dev:local
@@ -102,6 +102,25 @@ sudo /usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py in
 sudo /usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py utilisation
 ```
 
+Each GPU's `pcie` object separates three things:
+
+| Fields | Meaning |
+| --- | --- |
+| `current_link_speed_gts`, `current_link_width` | The link right now. GPUs train down to 2.5 GT/s at idle, so this is not a capability. |
+| `device_max_link_speed_gts`, `device_max_link_width` | What the card supports, regardless of slot. |
+| `path_max_link_speed_gts`, `path_max_link_width` | The lowest maximum along the card's upstream PCIe ports: the most the card can reach in this slot. `null` if any port reports an unknown value. |
+
+`upstream_ports` lists those ports from the card towards the CPU; a card behind the
+chipset has several and shares the chipset uplink. On the current broker host, CUDA0
+(`0000:04:00.0`) is behind the chipset and limited to 8 GT/s x4 (Gen3 x4), while CUDA1
+(`0000:2b:00.0`) is on a CPU root port at 16 GT/s x8 (Gen4 x8); both cards report a
+device maximum of 32 GT/s x8.
+
+`cuda_device` uses the CUDA driver's default device order on the host. It matches
+llama.cpp's `CUDAn` only while the llama container sees all GPUs in the same order: do not
+set `CUDA_VISIBLE_DEVICES` or `CUDA_DEVICE_ORDER` there unless the helper's unit sets the
+same values with `Environment=`.
+
 The first `utilisation` response reports `cpu.sample_ready: false`, because it
 establishes the CPU baseline. Later samples return CPU percentage. NVIDIA or
 hardware-interface fields can be unavailable; the broker must preserve that
@@ -112,7 +131,17 @@ as unknown rather than infer it.
 The normal suite needs no Docker:
 
 ```sh
-pytest -q
+uv run pytest -q
+```
+
+Tests marked "real hardware" run only where NVML is available, such as the broker host,
+and are skipped elsewhere. The host-facts helper runs under the host's system `python3`
+(3.14 on the broker host), not the project environment, so check it with that interpreter
+too:
+
+```sh
+uv run --isolated --no-project --python /usr/bin/python3 --with pytest \
+  pytest -q tests/test_host_facts.py
 ```
 
 The systemd installation and migration test is deliberately opt-in. It uses a
@@ -121,9 +150,10 @@ Compose. Build its small local image first, then run the test:
 
 ```sh
 docker build --file tests/systemd/Dockerfile --tag model-broker-systemd-test:local tests
-MODEL_BROKER_RUN_SYSTEMD_INTEGRATION=1 pytest -q tests/test_systemd_integration.py
+MODEL_BROKER_RUN_SYSTEMD_INTEGRATION=1 uv run pytest -q tests/test_systemd_integration.py
 ```
 
-The integration test creates a legacy `llama-supervisor.service`, runs the
-installer, verifies that the legacy service is stopped and disabled, verifies
-the new socket ownership and mode, and makes an `inventory` request.
+The integration test image uses Ubuntu 26.04 to match the broker host. The test
+creates a legacy `llama-supervisor.service`, runs the installer, verifies that the
+legacy service is stopped and disabled, verifies the new socket ownership and mode, and
+makes an `inventory` request.
