@@ -1,231 +1,378 @@
 # Model broker design
 
-## Scope and decisions made
+## Scope and decisions
 
-The first broker is a custom Python service.  It exposes an OpenAI-compatible
-LLM API and forwards requests to the existing llama.cpp services.  It does not
-replace llama.cpp, its model presets, the different pinned llama.cpp builds, or
-the service-per-GPU-topology approach.
+The broker is a standalone Python service that exposes an authenticated, OpenAI-compatible API. It schedules model *variants*, asks one already-running upstream llama.cpp router to load and unload them, and proxies inference.
 
-The broker owns the *logical* model catalogue, request routing, resource
-knowledge, conflict prevention, and every rule for bringing a service up or
-down.  A small host-side supervisor is only a capability-limited Docker
-Compose executor.  Neither service should accept arbitrary Docker commands
-from an API client.
+The router runs in Docker as the `llama-cpp` Compose service. Docker starts it normally and keeps it running; the broker never calls Docker, Compose, systemd, or a host-side supervisor. There is no service-per-GPU-layout lifecycle in this design.
 
-Initially, Ollama and ComfyUI are external GPU users.  The supervisor observes
-them and blocks an incompatible llama request; it does not stop, start, or
-otherwise manage them.  ComfyUI will later be exposed through a separate API
-adapter, rather than being presented as an OpenAI model.
+The deployment in the server-containers repository supplies the unified llama.cpp preset. The broker only needs a readable path to that file; it does not need that repository, Docker Compose files, model directories, or GPU devices. It is deliberately based on upstream llama.cpp. Existing experimental MoE forks remain available for benchmarking, but are not on the normal broker path. In particular, Flash Next initially uses its upstream preset; a fork is not selected merely because it has a potentially better benchmark result.
 
-## Existing llama service contract
+The initial implementation schedules only llama.cpp. It is the first compute
+adapter in the broker. Future adapters may manage ComfyUI, Ollama, or another
+significant-compute application, but they extend the same single broker rather
+than creating another broker service.
 
-`llama-cpp/render-compose.py` is the canonical renderer for an approved
-profile env file.  It creates one materialised Compose service with the
-correct pinned source build, model/config volumes, GPU visibility, shared GPU
-lock, and service identity.  The supervisor will use this renderer and Compose
-for now; it will not reproduce the service definition through arbitrary
-`docker run` calls.
+## Compute adapters
 
-Each GPU profile holds its GPU lock for the lifetime of its llama-server.  An
-idle server therefore still occupies its declared logical resource set until
-the supervisor stops it.  The lock is a final collision guard; the supervisor
-makes the scheduling decision before trying a start.
+An adapter connects the broker's scheduling policy to one application. The
+first adapter, `LlamaCppAdapter`, knows how to inspect the unified preset,
+query the llama.cpp router, load and unload a variant, and proxy supported
+inference requests. The broker owns global resource accounting, request
+lifetimes, authentication, and public API policy; an adapter does not make
+independent GPU scheduling decisions.
 
-The normal upstream server is already configured as a llama.cpp router with
-one loaded model maximum and model autoloading.  A started profile can serve
-one of the models offered by its preset; a different service/profile is still
-selected when a different build, GPU layout, or resource set is required.
+The adapter boundary will be deliberately small. It will use either an
+abstract base class or a Python typing protocol; that choice is still to be
+made. It covers application integrations only, such as discovering configured
+workloads, reporting their state, loading or stopping a workload, and
+forwarding a supported request. For example, a future ComfyUI adapter can
+expose workflow execution without being forced to pretend it has
+llama.cpp-style model loading.
 
-## Catalogue
+The broker calls an adapter through that boundary and keeps the resulting
+resource claims in one central scheduler. New adapters are registered during
+application startup from explicit configuration; they are not plugins uploaded
+through the public API.
 
-The catalogue is held in one broker-owned JSON file for the first release, for
-example `/state/catalogue.json`.  It is written atomically (write temporary
-file, fsync, then rename) and survives broker restarts through its persistent
-volume.  SQLite is deliberately deferred.
+## Standalone configuration
 
-The authoritative source of model IDs is each running llama.cpp service's
-`GET /v1/models` response, not a parser for model directories or preset files.
-The static broker configuration contains only the approved service profiles,
-their resources, and their Compose launch details.
+The model-broker repository contains its own container image, application configuration, and `.env.example`. It has no build-time dependency on server-containers. A deployment provides its environment through Docker Compose, systemd, Kubernetes, or a normal `.env` file.
 
-### Explicit catalogue refresh
+Only these settings are required to start:
 
-`POST /admin/catalogue/refresh` starts a distinct, serial maintenance job.
-The broker first prevents conflicting provisioning actions and waits for any
-existing managed request leases to drain.  For each enabled profile, in a
-configured order:
+```dotenv
+# Address reachable from the broker container or host process.
+MODEL_BROKER_LLAMA_URL=http://llama-cpp:8080
 
-1. The broker checks and reserves the profile's resource set, then asks the
-   supervisor to start the service.
-2. Once the supervisor reports the container ready, the broker queries that
-   service's `/v1/models` endpoint on the private backend network.
-3. The broker replaces that profile's previous entries with the returned
-   entries, computes additions and removals, and writes the JSON catalogue.
-4. It asks the supervisor to stop the temporary service, then releases its
-   broker-held resource reservation before considering the next conflicting
-   profile.
-
-If a service cannot start or be queried, its previous catalogue entries are
-retained and marked `stale`; failure is never interpreted as a model removal.
-The refresh endpoint returns a job ID and job status is available separately,
-so an HTTP client does not have to remain connected for the whole serial pass.
-
-### Passive refresh
-
-Whenever the supervisor starts a profile for a normal model request, it emits
-a `profile_ready` event to the broker.  The broker queries `/v1/models` and
-reconciles just that profile before sending a request to it.  This catches
-configuration or build changes without running a full refresh.
-
-The external API always uses a stable qualified name:
-
-```text
-<profile-id>/<backend-model-id>
+# Read-only path inside the broker container or host process.
+MODEL_BROKER_PRESET_PATH=/config/models-preset.ini
 ```
 
-For example, `upstream-16g-gpu0/qwen2.5-coder-14b-instruct-q6_k` and
-`upstream-32g/qwen2.5-coder-14b-instruct-q6_k` are intentionally different
-models to clients.  A future unqualified alias may point to a configured
-preferred profile, but qualified names are the durable API contract.
+The server-containers Compose service will mount the same unified preset into
+the broker at the configured path and set `MODEL_BROKER_LLAMA_URL` to the
+llama service's Compose name. A non-Docker deployment can instead use an IP or
+DNS name and a local mounted copy of the preset.
 
-### Logging
+Other settings have safe development defaults and should be documented in
+`.env.example`: listen address and port, API/admin key sources, load/unload
+timeouts, idle-unload timeout, bounded request wait, CPU concurrency budget,
+and log level. Secrets must be supplied through the deployment environment or
+a secrets mount, never committed in `.env`.
 
-The broker writes structured JSON Lines to a persistent, rotating log file at
-`/state/log/model-broker.jsonl`.  It records catalogue job start/finish,
-profile starts/stops, model additions/removals, stale-catalogue failures,
-resource denials, and request lifecycle summaries.  It must never record API
-keys, Authorization headers, prompts, completions, or model input/output.
+## Unified llama.cpp contract
 
-Representative entries are:
+The `llama-cpp` container can see both CUDA devices. The router starts with the unified preset and `--no-models-autoload`. It does not receive router-wide placement arguments such as `--device`, `--split-mode`, `--main-gpu`, `--tensor-split`, or `--n-gpu-layers`: such arguments would override the placement encoded in an individual preset.
 
-```json
-{"event":"catalogue.model_added","profile":"upstream-16g-gpu0","model":"qwen2.5-coder-14b-instruct-q6_k","external_model":"upstream-16g-gpu0/qwen2.5-coder-14b-instruct-q6_k"}
-{"event":"catalogue.model_removed","profile":"upstream-16g-gpu0","model":"obsolete-model"}
-{"event":"catalogue.profile_query_failed","profile":"schwerz-16g-gpu1","catalogue_retained":true}
+The preset contains all effective settings for each model section. This is important because a model section is self-contained rather than relying on router-wide defaults. CPU-only variants use `device = none` and `n-gpu-layers = 0`; GPU variants declare their CUDA device(s), GPU layer count, and any tensor split themselves.
+
+The router has a small `models-max` limit (currently three) as a process-count backstop. It is not a resource scheduler: it neither understands which GPU a model occupies nor resolves an out-of-memory conflict. The broker makes those decisions before asking the router to load a model.
+
+At deployment time, verify the relation between `CUDA0`/`CUDA1` and physical cards with `llama-server --list-devices` in the image. The broker configuration uses those llama.cpp device identifiers, not a guessed PCI bus order.
+
+## Preset-derived catalogue
+
+`models-preset.ini` is the sole model catalogue. It is mounted read-only into both the router and the broker. The broker does not scan model directories, maintain a JSON catalogue, or discover models by briefly starting alternative services.
+
+On startup, the broker parses and validates every preset section and builds immutable `Variant` dataclasses in memory. It materialises a `[*]` defaults section if a future preset uses one; the present unified file has already materialised its effective values. A variant contains at least:
+
+```python
+@dataclass(frozen=True)
+class Variant:
+    id: str                     # INI section / public model ID
+    model_path: str
+    settings: Mapping[str, str] # effective llama.cpp settings
+    claims: tuple[ResourceClaim, ...]
+    resource_class: str         # gpu_resident, moe_offload, or cpu_weights
 ```
 
-## Resources and scheduling
+The public model ID is exactly the preset section name, for example `Qwen3.8-Flash-Next-UD-Q3_K_XL--cuda1`. The final suffix is an intentional, stable part of the ID, not a display label:
 
-A resource set is a fixed, non-negotiable set of logical tokens assigned to a
-profile.  It is not an attempt to infer spare VRAM and pack another process
-onto a GPU.  This is intentionally conservative.
+| Suffix | Required preset placement | Broker resource claim |
+| --- | --- | --- |
+| `--cuda0` | `device = CUDA0`, normally `split-mode = none` | `{GPU0}` |
+| `--cuda1` | `device = CUDA1`, normally `split-mode = none` | `{GPU1}` |
+| `--cuda0-cuda1` | `device = CUDA0,CUDA1` | `{GPU0, GPU1}` |
+| `--cpu` | `device = none`, `n-gpu-layers = 0` | no GPU |
 
-The initial logical resources are `GPU0`, `GPU1`, and `RAM`.
+The suffix table describes the GPU part of a claim. Every variant also has CPU
+and RAM-for-weights claims, derived from its preset settings.
 
-| Profile family | Initial resource set |
+Startup validation rejects a malformed or ambiguous preset rather than silently scheduling it. It verifies that every section has a model and a recognised suffix, that its `device` agrees with that suffix, and that CPU variants have zero GPU layers. It derives CPU and RAM-for-weights demand classes from `threads`, `threads-batch`, `n-gpu-layers`, and `n-cpu-moe`.
+
+## Managed resources and hardware interfaces
+
+The broker builds its managed-resource collection from the parsed preset. It
+does not require a hand-maintained list of GPUs. The collection always contains
+`CPU` and `RAM:weights`; it adds one GPU resource for every CUDA identifier
+used by a preset, for example `GPU0` and `GPU1`. A preset with a new
+`CUDA2` variant therefore creates a `GPU2` resource when it is validated.
+
+Each variant produces explicit, typed claims:
+
+| Preset evidence | Derived claim |
 | --- | --- |
-| Upstream 16 GB on GPU 0 | `{GPU0}` |
-| Upstream 16 GB on GPU 1 | `{GPU1}` |
-| Upstream 32 GB / all GPUs | `{GPU0, GPU1}` |
-| Upstream CPU | `{RAM}` |
-| GenerelSchwerz 16 GB on GPU 1 | `{GPU1, RAM}` |
-| GenerelSchwerz 32 GB / all GPUs | `{GPU0, GPU1}` |
-| csantiago78 / all GPUs | `{GPU0, GPU1}` |
+| `device = CUDA0[,CUDA1...]` | The listed GPU resources. |
+| `threads` and `threads-batch` | CPU compute demand. |
+| `device = none` / CPU-resident layers | `RAM:weights` demand for CPU-resident weights. |
+| `n-cpu-moe > 0` | `RAM:weights` demand for expert offload, plus CPU compute demand. |
 
-`RAM` is a deliberate exclusive logical slot in this first policy.  It means
-the CPU service and the single-GPU GenerelSchwerz service are considered
-incompatible, even if aggregate host RAM monitoring suggests that a particular
-combination might fit.  It can be replaced later by a capacity-aware RAM model
-only after measured evidence supports it.
+This makes CPU and RAM part of scheduling from the start, even where the
+broker cannot yet state an exact byte or core requirement. The initial policy
+is deliberately binary: a CPU-weights model and an MoE model with CPU expert
+offload both claim `RAM:weights` exclusively. They therefore do not run
+together. Fully GPU-resident variants still record their CPU/RAM demand, but
+the initial policy allows them to coexist when their GPU claims do not
+overlap.
 
-GPU IDs remain the host/NVIDIA indices used by the existing env files and
-Compose `device_ids`; the broker does not translate them to UUIDs.  The 16 GB
-GenerelSchwerz profile is fixed to GPU 1 (and therefore conflicts with any
-other profile using GPU 1).  Before enabling scheduling, the broker runs its
-GPU observation preflight for `llama-cpp/gpu-pcie-link.py 1` and requires the
-configured PCIe-generation expectation for the PCIe-4-connected card.  The
-registry records that expectation and, if useful, a minimum lane width.  A
-failed preflight prevents the broker selecting the Schwerz profile.
+The claim format must support a future capacity policy without changing the
+public model IDs or the llama adapter boundary. It can later add measured RAM weight
+bytes, CPU thread budgets, memory bandwidth, and a performance cost for
+coexistence. That permits a deliberate choice such as an MoE on GPU1 with
+expert weights in RAM while a small CPU model also uses RAM: slower, but not
+automatically impossible. Such combinations remain disabled until measurements
+define safe limits and acceptable performance.
 
-For a request, the broker selects a profile only when all its resource tokens
-are free.  It may ask the supervisor to stop a conflicting *broker-managed*
-profile only if that profile has no active broker request lease and has
-exceeded its idle grace period.  It never preempts an active request.  Foreign
-GPU processes, Ollama, and ComfyUI cause a graceful `resource_busy` refusal
-rather than an automatic stop.
+The design reserves room for optional hardware-interface facts. When enabled
+in a later deployment, the broker can map llama.cpp CUDA identifiers to kernel
+devices and obtain the facts needed here: a GPU's PCI/PCIe interface, negotiated
+link generation, and link width. It may also obtain reliable RAM/NUMA interface
+facts. Unknown means unknown; the broker must not infer a RAM-interface
+characteristic that the host does not expose.
 
-## Networking and access
+Hardware-interface observation is not implemented or collected in the initial
+broker, and it has no scheduling effect yet. It is ordinary broker
+functionality, not a compute adapter and not part of the llama adapter
+interface.
 
-The broker is a Compose service.  Llama services remain Compose-launched for
-now, but only the host supervisor starts and stops them.  They join an internal
-`model-backends` network with the broker; clients do not join that network.
-The broker also joins a separate internal client network for the future harness
-and the existing private HTTPS-gateway network when LAN HTTPS access is wanted.
+## Privileged host facts
 
-After migration, generated llama services have no published host ports.  The
-broker reaches a backend by its approved service name on port 8080.  Existing
-clients such as Pi and DeepSeek migrate to the broker endpoint so the broker's
-lease accounting becomes authoritative.
+The broker runs unprivileged and is never given a Docker socket, root account,
+or permission to execute arbitrary host commands. When the deployment needs
+host facts, it uses a small root-owned `model-broker-host-facts` systemd
+service. This is an observation helper, not another broker: it makes no
+scheduling decisions, starts no applications, and has no model API.
 
-The broker authenticates external OpenAI API clients with broker API keys.  A
-catalogue refresh is an administrator-only action with a distinct admin key.
+The service exposes one Unix-domain socket, mounted only into the broker
+container. It accepts a small fixed, versioned request set:
 
-## Host supervisor boundary
+| Request | Returned facts |
+| --- | --- |
+| `inventory` | CUDA-to-kernel-device mapping and available hardware-interface facts. |
+| `utilisation` | CPU use, host RAM use/availability, and GPU utilisation and memory use. |
 
-`model-supervisor` is a thin systemd service, not a network server.  It owns
-only Docker daemon access and execution of approved Compose actions.  It has
-no knowledge of GPUs, RAM, model catalogues, idle time, request activity,
-external blockers, or eviction policy.  The broker owns all of those concerns,
-including HTTP proxying and every model API query.
+The helper reads only the operating system's read-only information sources:
+procfs/sysfs for CPU, RAM, NUMA, and PCIe facts; and the NVIDIA management
+interface for GPU identity, utilisation, and memory use. It returns structured
+values, never an arbitrary command's output. The socket is root-owned and
+restricted to the broker's dedicated group; the helper verifies the connecting
+peer and rejects all other operations. It has no write operations and no
+ability to change kernel, GPU, Docker, or llama state.
 
-The supervisor is deliberately service-agnostic.  Its root-owned manifest maps
-an approved profile ID to a renderer input, Compose project/files, and Compose
-service name.  This allows a non-llama service to be added later, but it does
-not grant an API caller the ability to name an arbitrary file, image, bind
-mount, Compose project, service, or command-line option.
+`MODEL_BROKER_HOST_FACTS_SOCKET` is optional. Without it, the broker remains
+fully functional with its preset-derived resource inventory and llama activity
+monitoring; it simply reports host-interface and host-utilisation data as
+unavailable. When enabled, the broker samples the helper at a bounded interval
+and caches the latest timestamped facts. Sampling is for management visibility
+and analytics initially, not an automatic scheduling input.
 
-The broker communicates over one Unix-domain socket, for example
-`/run/model-supervisor/control.sock`.  systemd creates the private runtime
-directory and the supervisor binds this socket; it has no TCP listener.  The
-socket is owned by `model-supervisor:model-broker-api` with mode `0660`.
-Only the broker container receives that one socket as a bind mount and runs
-unprivileged with the dedicated numeric `model-broker-api` group.  Docker
-network membership does not grant access to a Unix socket, and no other
-container receives the mount.
+Changing the preset is a controlled configuration deployment. An admin reload parses and validates the new file first. It is permitted only when affected variants have no active leases; it refreshes the router's model list (using the router's documented reload mechanism) and atomically swaps the in-memory registry. A broker restart performs the same parse/validate operation.
 
-Messages are length-delimited JSON and contain an HMAC-SHA-256 over a
-timestamp, nonce, method, and canonical payload.  The HMAC key is root-created
-and mounted read-only only into the broker.  The supervisor rejects stale and
-replayed nonces.  Unix permissions and the absent network listener are the
-primary access control; the HMAC is defence in depth.  The supervisor still
-authorizes every operation against its own root-owned allowlist, so a
-compromised broker can request only approved lifecycle operations, never an
-arbitrary image, command, bind mount, or Compose path.
+## Router API contract
 
-Initial protocol methods are:
+The router is a private backend. The broker reaches it on the Compose network as `http://llama-cpp:8080`; clients do not call it directly. Once clients have migrated, the router should have no published host/LAN port. This makes the broker's scheduling and lease accounting authoritative.
+
+The broker uses the router's model-management endpoints:
 
 ```text
-compose(profile_id, action=up|start|stop|restart|rm|ps|logs)
-operation_status(operation_id)
+GET  /models
+POST /models/load       {"model": "<preset-section-id>"}
+POST /models/unload     {"model": "<preset-section-id>"}
 ```
 
-The supervisor maps an allowed action to a fixed argument vector.  For example,
-`up` runs the approved renderer then `docker compose ... up -d --no-build
---no-deps APPROVED_SERVICE`; `stop` runs `docker compose ... stop
-APPROVED_SERVICE`.  It returns the process exit status and sanitised standard
-output/error unchanged in meaning.  Thus a real Docker/llama failure such as a
-GPU lock collision has the same consequence as it would on the command line;
-the supervisor does not reinterpret it as resource policy.  Its action log
-goes to journald; the broker's user-visible catalogue log remains the
-persistent JSON Lines file described above.
+After a load or unload it polls `GET /models` until the desired state is reported, or until a bounded timeout. It then proxies the normal OpenAI-compatible request, initially `POST /v1/chat/completions`, preserving streaming responses. The upstream request's `model` field is the selected variant ID.
 
-The broker retains its own JSON state for resource reservations and request
-leases.  On broker restart it begins conservatively: it queries the supervisor
-for `ps`, treats running broker-managed profiles as occupied, and reconstructs
-its model state before attempting a conflicting start.  The existing llama GPU
-lock remains the final host-side collision guard.
+`--no-models-autoload` is intentional. A direct request for an unloaded model returns the router's “model is not loaded” error rather than starting a worker behind the broker's back. The broker is the only component that calls load and unload.
 
-GPU observation also belongs outside the supervisor.  The broker may use a
-small private `gpu-observer` companion, or be given NVIDIA's `utility` driver
-capability itself, to query NVML/nvidia-smi and the PCIe-link helper.  The
-utility capability is sufficient for NVML and nvidia-smi and does not require
-the CUDA `compute` capability.  That observer supplies facts; only the broker
-turns those facts into a scheduling decision.
+## Optional persistent KV-cache sessions
+
+The future orchestrator owns the real session: its messages, tool calls,
+intermediate results, workflow state, and decisions about which model to use.
+The broker may provide a persistent KV-cache as an optional acceleration. A KV
+cache is the model's computed attention state for a token prefix; it can avoid
+reprocessing an unchanged system prompt and conversation history. It is not a
+portable conversation format and cannot replace the orchestrator's record.
+
+The cache is valid only for the exact compatible model variant and runtime
+configuration. In particular, it must not be restored for another model,
+quantisation, tokenizer, context/KV-cache setting, or materially changed
+preset. A deployment or llama.cpp upgrade may also invalidate old cache files.
+The broker therefore derives a cache key from an opaque orchestrator session ID
+and a versioned variant-configuration fingerprint.
+
+llama.cpp supports saving and restoring an individual worker slot's prompt
+cache when the model server has a configured `--slot-save-path`. The llama
+container needs a persistent, writable cache volume; the broker needs no direct
+filesystem access to it. The adapter requests the documented internal APIs:
+
+```text
+POST /slots/{slot}?action=save     {"filename": "<broker-generated name>"}
+POST /slots/{slot}?action=restore  {"filename": "<broker-generated name>"}
+```
+
+The broker owns slot allocation and generated cache filenames. Neither the
+orchestrator nor an ordinary API client can select a slot or pass a filesystem
+path. Cache files are prompt-derived data, so the deployment applies protected
+storage, expiry, and a size quota.
+
+For a cache-aware request, the orchestrator provides a stable opaque session ID
+to the broker, for example in a broker-specific request header. The
+`LlamaCppAdapter` then:
+
+1. Ensures that the requested variant is loaded and reserves an idle slot.
+2. Restores a compatible snapshot for that session when one exists.
+3. Forwards the complete canonical conversation with prompt caching enabled.
+4. After the response is complete, saves the slot snapshot and releases the
+   slot for another request.
+
+This allows a later request to reload the same variant and recover useful
+prefix state after it was displaced by another model. It does not allow a
+cache to follow a conversation from one model to another.
+
+This feature is deliberately not enabled in the initial deployment. It needs
+an end-to-end acceptance test against the pinned router image and unified
+preset, including save, restore, model unload/reload, router restart, and
+verification that the next request actually reuses cached tokens. The broker
+must continue to work correctly when the test fails or no compatible snapshot
+exists: it simply sends the full canonical conversation and accepts the normal
+prefill cost.
+
+## Public API and server
+
+The broker, rather than llama.cpp, serves the public OpenAI-compatible API.
+The Python application is an ASGI application, initially implemented with
+FastAPI. Uvicorn is simply the ASGI web server: it listens for HTTP
+connections, turns them into ASGI requests, and streams responses back. API
+implementation, authentication, scheduling, model loading, and proxying remain
+application code; Uvicorn does not perform any of those jobs.
+
+The supported, broker-owned endpoints are registered explicitly:
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `GET /health` | Returns broker health and whether its router observation is current; intended for service health checks. |
+| `GET /metrics` | Exposes broker and collected llama activity in Prometheus format; restricted to the monitoring network. |
+| `GET /v1/models` | Returns the validated preset variants in OpenAI's `object: "list"` / `object: "model"` shape. |
+| `GET /v1/models/{model}` | Returns one variant or an OpenAI-style not-found error. |
+| `POST /v1/chat/completions` | Validates that `model` is a known variant, schedules it, loads it if necessary, and proxies the request and any SSE stream. |
+| `POST /admin/reload` | Authenticated administration endpoint that reloads the preset under the safety rules below. |
+
+The broker also obtains the router's OpenAPI document at startup. For every
+router operation not explicitly owned above, it registers a corresponding
+route from that schema. Initially those generated routes return a consistent
+OpenAI-style `501 not_implemented` response; they do not silently proxy a
+request that might use an unloaded model without scheduling it. This gives
+clients and the broker's generated `/openapi.json` an accurate, visible
+surface from the beginning.
+
+Adding support for another endpoint is a deliberate override: implement and
+test a broker-owned handler, register it in place of the generated placeholder,
+then proxy it only after extracting and scheduling any model reference it
+contains. Endpoints which have no model effect may later become straightforward
+pass-through handlers. If the router's schema cannot be fetched at startup,
+the explicit endpoints still start; generated routes are omitted and the
+failure is logged.
+
+## Scheduling and request lifecycle
+
+There is one broker service. It is the central authority for scheduling
+significant compute on this host. It keeps track of loaded models and busy
+GPUs in its own memory. The design does not include broker replicas.
+
+For each request, the broker:
+
+1. Authenticates the caller and resolves its requested preset ID to a validated `Variant`.
+2. Takes the scheduling lock and reconciles its state with `GET /models` when necessary.
+3. Reserves the variant's GPU and CPU class while deciding whether it can run.
+4. If it is not loaded, unloads incompatible *idle* workers, waits for their unloaded state, calls `/models/load`, and waits for it to be ready.
+5. Creates an active lease, releases the scheduling lock, and proxies the request or streaming response.
+6. Releases the lease only after the response stream ends, is cancelled, or fails. An idle cleanup task may unload a worker after its configured grace period and then releases its resource claim.
+
+An in-progress request is never interrupted to make room for another model. If
+the required GPU is busy, the broker waits for a short, configured time. If it
+does not become free, the broker returns `503 resource_busy` with
+`Retry-After`. A model with no current request may be replaced: the broker
+unloads it, observes that it is gone, then loads the requested variant. It
+never assumes that an unload is instantaneous.
+
+This yields the expected basic policy:
+
+| Active variant | Requested variant | Result |
+| --- | --- | --- |
+| `--cuda1` | `--cuda0` | May run concurrently. |
+| `--cuda0` | `--cuda1` | May run concurrently. |
+| `--cuda1` | `--cuda0-cuda1` | Wait/reject while active; otherwise unload the GPU1 worker, then load dual-GPU. |
+| `--cuda0` or `--cuda1` | `--cuda0-cuda1` | Same: dual-GPU requires both cards. |
+| `--cuda0-cuda1` | any GPU variant | Wait/reject while dual-GPU lease is active. |
+
+Consequently, Flash Next on GPU1 can run with a less-than-16-GB GPU0 variant, and two less-than-16-GB variants can run simultaneously, one per card. An MoE variant with `n-cpu-moe` still has its declared GPU claim, plus its CPU class; the PCIe characteristics are accounted for by selecting the right preset ID, not by moving a loaded model at runtime.
+
+CPU-only variants make no GPU claim. Their initial policy is conservative: variants with `n-cpu-moe > 0` are `moe_cpu` and consume a CPU-heavy scheduling slot. They do not run beside another CPU-heavy inference until measurements establish a safe capacity model. Pure CPU variants use the parsed thread settings and a small configurable CPU concurrency budget. This is a policy decision, not an assertion that llama.cpp itself reserves host CPU resources.
+
+More specifically, the initial `RAM:weights` rule treats CPU-weight models
+and MoE expert-offload models as mutually exclusive. This is intentionally
+more conservative than the hardware: the two may fit and run at the same
+time, but they compete for RAM capacity, memory bandwidth, and CPU work. The
+future capacity policy described above may admit a measured combination rather
+than treating it as a binary conflict.
+
+## Llama activity monitoring and analytics
+
+`LlamaCppAdapter` monitors the router independently of client requests. For
+management, it polls `GET /models` and, where available, consumes
+`GET /models/sse`. This records each configured model's status
+(unloaded, loading, loaded, sleeping, or failed), observes completion of
+broker-requested loads and unloads, and reconciles the broker's resource
+claims after a router or broker restart.
+
+The unified llama service enables its metrics endpoint. The adapter scrapes
+the router's model-scoped metrics as an input to operations and analytics,
+alongside information already known to the broker: queue time, load/unload
+duration, request/stream duration, cancellation, error outcome, and token or
+timing data returned by a request. The broker exposes its own aggregate health
+and metrics endpoint for the deployment's monitoring system; it does not
+expose the router management endpoints to ordinary clients.
+
+When the optional host-facts socket is configured, the same monitoring loop
+also records timestamped CPU, RAM, and GPU utilisation. It keeps those facts
+separate from the router's model status and from the scheduler's resource
+claims: utilisation describes what is happening, while a claim describes what
+the broker has reserved.
+
+Analytics are observational. They never trigger a scheduling action on their
+own in the initial design, and they never include prompts, completions, API
+keys, Authorization headers, or raw session identifiers. A later policy can
+use retained measurements to set resource capacities and make informed
+trade-offs, such as whether a mixed MoE/CPU workload is worthwhile.
+
+## Restart and failure handling
+
+On broker startup, it reads the preset and queries `GET /models`. It rebuilds loaded-worker/resource claims from the router's reported loaded variants before accepting new work. Request streams cannot survive a broker restart, but already-loaded router workers are not needlessly discarded.
+
+If loading fails or never reaches ready state, the broker removes the pending reservation, records the router state and safe error details, and returns a backend failure to the caller. If an unload fails, its resource claim remains reserved until reconciliation proves it is gone. The broker does not request an unsafe router LRU eviction and does not try to migrate a loaded model to a different GPU or to the CPU.
+
+## Networking, authentication, and logging
+
+The broker is the only externally reachable API service. It authenticates clients with broker API keys; administrative operations such as preset reload use separate admin credentials. The broker and router share only their internal Compose network. By default, the deployment gives the broker only the router URL and a read-only preset mount, plus normal service configuration and secrets. The optional host-facts Unix socket is the only additional host integration; it is read-only in effect and explicitly configured.
+
+The broker emits structured JSON logs for preset validation, load/unload transitions, resource decisions, timeouts, request lifecycle summaries, and reconciliation. It must not log API keys, Authorization headers, prompts, completions, or streamed model output.
 
 ## Deferred work
 
-- SQLite, multiple broker replicas, and distributed leases
-- Dynamic VRAM/RAM packing or automatic management of non-llama GPU users
-- Docker-SDK replacement of the established Compose launch path
-- OpenAI Responses API and a dedicated ComfyUI workflow/WebSocket adapter
+- Benchmarking and, only if justified, selectively reintroducing a maintained MoE fork for a named variant.
+- A measured CPU/RAM/VRAM capacity model, including controlled mixed MoE
+  expert-offload and CPU-weight workloads.
+- Optional hardware-interface and host-utilisation observation through the
+  host-facts service.
+- Coordination with ComfyUI, Ollama, or other external GPU users.
+- Additional OpenAI endpoints such as Responses API and non-llama backends.
