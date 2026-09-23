@@ -4,15 +4,22 @@ version = "0.1.0"
 description = "OpenAI-compatible broker for managed local LLM services"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27,<1",
     "pre-commit",
     "pyright",
     "pytest",
     "ruff",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py313"
@@ -30,6 +37,8 @@ docstring-code-format = true
 
 [tool.pyright]
 pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
 typeCheckingMode = "strict"
 include = [
     "src",

@@ -1,0 +1,7 @@
+.git
+.venv
+.ruff_cache
+.pyright
+__pycache__
+*.py[cod]
+tests

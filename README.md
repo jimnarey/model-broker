@@ -1,5 +1,48 @@
 # Model broker scaffolding
 
+A broker service for managing llama requests requiring different models
+with different resource requirements.
+
+## Broker API
+
+`model_broker.application` is the first FastAPI layer of the broker. On startup
+it obtains the private router OpenAPI document from `MODEL_BROKER_LLAMA_URL`.
+It registers a safe `501 not_implemented` placeholder for each router operation
+that the broker does not own yet, so the broker OpenAPI document exposes the
+visible router surface without proxying a request around scheduling.
+
+`GET /health` is broker-owned and remains available when the router schema
+cannot be fetched. `POST /v1/chat/completions` is the first bespoke override:
+it returns a broker-specific `501` until validation, scheduling, loading, and
+proxying are implemented. It is never generated from, or passed through to,
+the router.
+
+Run locally with the project environment:
+
+```sh
+uv run uvicorn model_broker.application:app --host 127.0.0.1 --port 8000
+```
+
+The supplied [`.env.example`](.env.example) lists the current environment
+settings.
+
+### Container
+
+The [Dockerfile](Dockerfile) has an Ubuntu 24.04 runtime base. It uses the
+locked dependency set and lets `uv` provide the Python 3.13 runtime required by
+this project. It does not mount a Docker socket, host device, or host-facts
+socket.
+
+```sh
+docker build --tag model-broker-dv:local .
+docker run --rm --publish 8000:8000 \
+  --env MODEL_BROKER_LLAMA_URL=http://llama-cpp:8080 \
+  model-broker-dev:local
+```
+
+The router address must be reachable from the broker container; in a normal
+deployment it is the private service DNS name.
+
 ## Model-broker host facts
 
 `model-broker-host-facts.py` is the optional, root-owned observation helper
