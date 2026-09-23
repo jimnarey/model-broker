@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
 from model_broker.application import (
     RouterSchemaError,
@@ -34,64 +33,84 @@ ROUTER_DOCUMENT: dict[str, Any] = {
 }
 
 
-def client_for(document: object) -> TestClient:
-    """A client for a broker whose router returns ``document``, or raises it if an exception."""
+async def with_broker_client[T](
+    document: object, action: Callable[[httpx.AsyncClient], Awaitable[T]]
+) -> T:
+    """Start a broker against document, run action through ASGI, then close it cleanly."""
 
     async def fetch(_: Settings) -> object:
+        """Return the supplied router document or raise its configured failure."""
         if isinstance(document, Exception):
             raise document
         return document
 
-    return TestClient(create_app(SETTINGS, fetch))
+    app = create_app(SETTINGS, fetch)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://broker.test") as client:
+            return await action(client)
 
 
-@pytest.fixture
-def client() -> Iterator[TestClient]:
-    """A started broker (lifespan run) whose router serves ROUTER_DOCUMENT."""
-    with client_for(ROUTER_DOCUMENT) as client:
-        yield client
+def broker_request[T](document: object, action: Callable[[httpx.AsyncClient], Awaitable[T]]) -> T:
+    """Run an ASGI broker request from a synchronous pytest test."""
+    return asyncio.run(with_broker_client(document, action))
 
 
 # Startup with a reachable router
 
 
-def test_undeclared_router_operations_become_placeholders(client: TestClient) -> None:
+def test_undeclared_router_operations_become_placeholders() -> None:
     """Router operations the broker does not own appear in the broker's OpenAPI document.
 
     Setup: the router declares chat completions, embeddings, and GET /models/{model}.
     Expect: embeddings and the model lookup keep their operationIds, and health reports two
     generated operations; chat completions is not counted because the broker owns it.
     """
-    paths = client.get("/openapi.json").json()["paths"]
+
+    async def request(client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Fetch the generated schema and health report from the started broker."""
+        return (await client.get("/openapi.json")).json(), (await client.get("/health")).json()
+
+    schema, health = broker_request(ROUTER_DOCUMENT, request)
+    paths = schema["paths"]
 
     assert paths["/v1/embeddings"]["post"]["operationId"] == "createEmbedding"
     assert paths["/models/{model}"]["get"]["operationId"] == "getModel"
-    assert client.get("/health").json()["router_openapi"] == {
+    assert health["router_openapi"] == {
         "available": True,
         "error": None,
         "generated_operations": 2,
     }
 
 
-def test_placeholder_returns_openai_style_501(client: TestClient) -> None:
+def test_placeholder_returns_openai_style_501() -> None:
     """Calling a placeholder returns 501 in the OpenAI error shape instead of proxying.
 
     The path parameter case checks that placeholders accept templated paths as well.
     """
-    for response in (client.post("/v1/embeddings", json={}), client.get("/models/any")):
+
+    async def request(client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response]:
+        """Call one generated POST route and one generated path-parameter route."""
+        return await client.post("/v1/embeddings", json={}), await client.get("/models/any")
+
+    for response in broker_request(ROUTER_DOCUMENT, request):
         assert response.status_code == 501
         assert response.json()["error"]["type"] == "not_implemented"
         assert response.json()["error"]["code"] == "not_implemented"
 
 
-def test_router_cannot_replace_the_broker_chat_endpoint(client: TestClient) -> None:
+def test_router_cannot_replace_the_broker_chat_endpoint() -> None:
     """Chat completions keeps the broker's handler even though the router also declares it.
 
     Expect the broker-specific error code. If a placeholder had replaced it, a later proxying
     placeholder would let clients bypass scheduling through this path.
     """
-    response = client.post("/v1/chat/completions", json={"model": "example"})
 
+    async def request(client: httpx.AsyncClient) -> httpx.Response:
+        """Call the broker-owned chat endpoint after generated routes are registered."""
+        return await client.post("/v1/chat/completions", json={"model": "example"})
+
+    response = broker_request(ROUTER_DOCUMENT, request)
     assert response.status_code == 501
     assert response.json()["error"]["code"] == "broker_scheduling_not_implemented"
 
@@ -105,9 +124,13 @@ def test_broker_starts_when_router_is_unreachable() -> None:
     Expect: /health returns 200 with the fetch error, and no placeholder exists, since the
     broker has not learned any router operations.
     """
-    with client_for(RouterSchemaError("connection refused")) as client:
-        health = client.get("/health")
-        paths = client.get("/openapi.json").json()["paths"]
+
+    async def request(client: httpx.AsyncClient) -> tuple[httpx.Response, dict[str, Any]]:
+        """Fetch broker health and its generated schema after a failed startup fetch."""
+        return await client.get("/health"), (await client.get("/openapi.json")).json()
+
+    health, schema = broker_request(RouterSchemaError("connection refused"), request)
+    paths = schema["paths"]
 
     assert health.status_code == 200
     assert health.json()["router_openapi"] == {
@@ -126,13 +149,17 @@ def test_malformed_document_registers_nothing() -> None:
     the routes that actually exist.
     """
     document = {"paths": {"/v1/embeddings": {"post": {}}, "/broken": "not an object"}}
-    with client_for(document) as client:
-        status = client.get("/health").json()["router_openapi"]
-        paths = client.get("/openapi.json").json()["paths"]
 
-    assert status["available"] is False
-    assert "/broken" in status["error"]
-    assert status["generated_operations"] == 0
+    async def request(client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Read health and schema after the invalid document is rejected at startup."""
+        return (await client.get("/health")).json(), (await client.get("/openapi.json")).json()
+
+    health, schema = broker_request(document, request)
+    paths = schema["paths"]
+
+    assert health["router_openapi"]["available"] is False
+    assert "/broken" in health["router_openapi"]["error"]
+    assert health["router_openapi"]["generated_operations"] == 0
     assert "/v1/embeddings" not in paths
 
 
@@ -169,6 +196,7 @@ def test_router_operations_skips_non_operation_keys() -> None:
 
 
 def fetch_with(handler: Any) -> object:
+    """Fetch one mock router response through the production HTTP client."""
     return asyncio.run(fetch_router_openapi(SETTINGS, httpx.MockTransport(handler)))
 
 
@@ -177,6 +205,7 @@ def test_fetch_requests_the_router_openapi_path() -> None:
     requested: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Record the URL and return the test router document."""
         requested.append(str(request.url))
         return httpx.Response(200, json=ROUTER_DOCUMENT)
 

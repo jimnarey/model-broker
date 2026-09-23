@@ -272,8 +272,14 @@ router operation not explicitly owned above, it registers a corresponding
 route from that schema. Initially those generated routes return a consistent
 OpenAI-style `501 not_implemented` response; they do not silently proxy a
 request that might use an unloaded model without scheduling it. This gives
-clients and the broker's generated `/openapi.json` an accurate, visible
+clients and the broker's generated `/openapi.json` a visible
 surface from the beginning.
+
+Initially, the generated OpenAPI entries preserve the path, method, operation ID, summary,
+and description only. They do not yet reproduce router parameters, request bodies, response
+schemas, security requirements, tags, or other metadata. This is a temporary limitation: the
+full router contract must be copied before the broker OpenAPI document is treated as suitable
+input for generated clients.
 
 Adding support for another endpoint is a deliberate override: implement and
 test a broker-owned handler, register it in place of the generated placeholder,

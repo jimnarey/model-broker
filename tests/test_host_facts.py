@@ -284,6 +284,32 @@ def test_pci_facts_path_limit_is_unknown_when_any_port_is_unknown(
     assert pcie["path_max_link_width"] == 4
 
 
+def test_pci_facts_path_limit_is_unknown_when_an_upstream_port_omits_a_link_file(
+    host_facts: Any, tmp_path: Path
+) -> None:
+    """A missing link-speed file is unknown rather than the end of the PCIe path.
+
+    Setup: the chipset switch has a valid PCI device directory and link width, but no
+    ``max_link_speed`` file. This models a kernel or platform that omits one sysfs value.
+    Expect: the switch and root port remain in ``upstream_ports`` and the path speed is None.
+    Stopping at the missing file would hide both ports and incorrectly report 8 GT/s from the
+    lower part of the path.
+
+    The link width remains 4 because every port still reports a width. Speed and width are
+    deliberately independent observations: the absence of one must not discard a known value
+    for the other.
+    """
+    devices = chipset_gpu(tmp_path)
+    switch = tmp_path / "devices" / "pci0000:00" / "0000:00:01.2" / "0000:02:00.2"
+    (switch / "max_link_speed").unlink()
+
+    pcie = host_facts.pci_facts("0000:04:00.0", devices)["pcie"]
+
+    assert pcie["path_max_link_speed_gts"] is None
+    assert pcie["path_max_link_width"] == 4
+    assert pcie["upstream_ports"] == ["0000:03:00.0", "0000:02:00.2", "0000:00:01.2"]
+
+
 def test_pci_facts_for_missing_device(host_facts: Any, tmp_path: Path) -> None:
     """A device NVML reports but sysfs lacks has every fact unknown rather than invented."""
     facts = host_facts.pci_facts("0000:99:00.0", tmp_path)
@@ -350,7 +376,9 @@ def test_nvidia_inventory_on_real_hardware(host_facts: Any) -> None:
         assert (host_facts.SYS_PCI / device["pci_bus_id"]).is_dir()
         assert device["cuda_device"] is not None
         assert device["kernel_devices"]
-        assert device["pcie"]["path_max_link_speed_gts"] is not None
+        for field in ("path_max_link_speed_gts", "path_max_link_width"):
+            value = device["pcie"][field]
+            assert value is None or value > 0
         assert device["memory_total_bytes"]
 
 
@@ -402,6 +430,12 @@ def test_prepare_socket_removes_a_stale_socket(host_facts: Any, short_directory:
 
 
 def test_prepare_socket_rejects_unknown_group(host_facts: Any, tmp_path: Path) -> None:
+    """A configured group must exist before the root helper creates its socket.
+
+    Failing before binding avoids creating a socket with a fallback owner or weaker access
+    boundary. The installer creates the dedicated group, so this protects manual or malformed
+    service configuration.
+    """
     with pytest.raises(ValueError, match="socket group does not exist"):
         host_facts.prepare_socket(tmp_path / "facts.sock", "no-such-group-model-broker")
 

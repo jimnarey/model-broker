@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import platform
+import re
 import socket
 import socketserver
 import struct
@@ -37,6 +38,7 @@ PROC_STAT = Path("/proc/stat")
 PROC_MEMINFO = Path("/proc/meminfo")
 SYS_PCI = Path("/sys/bus/pci/devices")
 SYS_NODE = Path("/sys/devices/system/node")
+PCI_DEVICE_DIRECTORY = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", re.IGNORECASE)
 
 JsonObject = dict[str, Any]
 CpuSample = tuple[int, int]
@@ -181,10 +183,14 @@ def link_speed_gts(text: str | None) -> float | None:
 
 
 def link_chain(device: Path) -> list[Path]:
-    """Return the device followed by each upstream PCIe port on its path to the CPU."""
+    """Return the device and every upstream PCIe device on its path to the CPU.
+
+    The directory name identifies a PCIe device.  Its link files may be absent, and that
+    absence is a hardware fact rather than the end of the PCIe path.
+    """
     chain: list[Path] = []
     path = device.resolve()
-    while (path / "max_link_speed").is_file():
+    while PCI_DEVICE_DIRECTORY.fullmatch(path.name):
         chain.append(path)
         path = path.parent
     return chain

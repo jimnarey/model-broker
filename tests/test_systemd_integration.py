@@ -1,4 +1,4 @@
-"""Opt-in container test for installation, systemd activation, and migration.
+"""Opt-in container test for a clean host-facts installation under systemd.
 
 Build the image first: ``docker build --file tests/systemd/Dockerfile --tag
 model-broker-systemd-test:local tests``, then set MODEL_BROKER_RUN_SYSTEMD_INTEGRATION=1.
@@ -20,14 +20,6 @@ IMAGE = "model-broker-systemd-test:local"
 PROJECT = Path(__file__).parents[1].resolve()
 SOCKET = "/run/model-broker-host-facts/facts.sock"
 CTL = "/usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py"
-LEGACY_UNIT = """\
-[Unit]
-Description=legacy Docker supervisor
-[Service]
-ExecStart=/bin/sleep infinity
-[Install]
-WantedBy=multi-user.target
-"""
 
 Exec = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -74,35 +66,50 @@ def container() -> Iterator[Exec]:
         run("docker", "rm", "--force", container_id)
 
 
-def test_installer_replaces_legacy_supervisor_and_serves_facts(container: Exec) -> None:
-    """The installer disables the old supervisor, starts the helper, and the helper answers.
+def test_clean_install_starts_the_service_and_serves_authorised_clients(container: Exec) -> None:
+    """A clean install starts the helper and admits a client in its dedicated group.
 
-    Setup: a stand-in ``llama-supervisor.service`` is installed, enabled, and running, as on a
-    host from before the redesign. Then install-model-broker-host-facts.sh runs as root.
-    Expect:
-    - the new service is active;
-    - the legacy service is both stopped and disabled, so it cannot come back at boot (the
-      migration must remove the old Docker-capable control path, not run beside it);
-    - the socket is root:model-broker-host-facts-client with mode 660, which is the access
-      boundary the broker container is granted through group_add;
-    - the installed control client gets a successful inventory response.
+    Setup: an otherwise empty systemd container runs the installer as root. The test then
+    creates an ordinary user in the socket's client group and bind-mounts the socket into
+    ``/tmp``. The mount models deployment: the broker container receives the socket itself,
+    not the root-owned runtime directory that contains it.
+
+    Expect: systemd reports the service active, the socket has the documented root, group, and
+    0660 permissions, and the ordinary group member can request both supported operations.
+    This checks the installed service's useful behaviour without creating or testing any legacy
+    supervisor or migration path.
     """
-    legacy = container(
-        "tee", "/etc/systemd/system/llama-supervisor.service", input_text=LEGACY_UNIT
-    )
-    assert legacy.returncode == 0
-    assert container("systemctl", "daemon-reload").returncode == 0
-    assert container("systemctl", "enable", "--now", "llama-supervisor.service").returncode == 0
-    assert container("systemctl", "is-active", "llama-supervisor.service").returncode == 0
-
     installed = container("bash", "/opt/model-broker/install-model-broker-host-facts.sh")
     assert installed.returncode == 0, installed.stderr
 
     assert container("systemctl", "is-active", "model-broker-host-facts.service").returncode == 0
-    assert container("systemctl", "is-active", "llama-supervisor.service").returncode != 0
-    assert container("systemctl", "is-enabled", "llama-supervisor.service").returncode != 0
     ownership = container("stat", "--format=%U:%G:%a", SOCKET).stdout.strip()
     assert ownership == "root:model-broker-host-facts-client:660"
-    response = container("python3", CTL, "inventory")
-    assert response.returncode == 0, response.stderr
-    assert json.loads(response.stdout)["ok"] is True
+    assert (
+        container(
+            "useradd",
+            "--create-home",
+            "--groups",
+            "model-broker-host-facts-client",
+            "broker-client",
+        ).returncode
+        == 0
+    )
+    assert container("touch", "/tmp/facts.sock").returncode == 0
+    mounted = container("mount", "--bind", SOCKET, "/tmp/facts.sock")
+    assert mounted.returncode == 0, mounted.stderr
+
+    for operation in ("inventory", "utilisation"):
+        response = container(
+            "runuser",
+            "--user",
+            "broker-client",
+            "--",
+            "python3",
+            CTL,
+            "--socket",
+            "/tmp/facts.sock",
+            operation,
+        )
+        assert response.returncode == 0, response.stderr
+        assert json.loads(response.stdout)["ok"] is True

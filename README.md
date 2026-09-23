@@ -11,6 +11,13 @@ It registers a safe `501 not_implemented` placeholder for each router operation
 that the broker does not own yet, so the broker OpenAPI document exposes the
 visible router surface without proxying a request around scheduling.
 
+For now, these generated entries intentionally have limited OpenAPI detail: they preserve
+the path, HTTP method, operation identifier, summary, and description, but not router
+parameters, request bodies, response schemas, security requirements, tags, or other
+metadata. They are a safe list of visible endpoints, not yet a full copy of the router
+contract. This is a temporary limitation to come back to before clients rely on the
+broker OpenAPI document for generated client code.
+
 `GET /health` is broker-owned and remains available when the router schema
 cannot be fetched. `POST /v1/chat/completions` is the first bespoke override:
 it returns a broker-specific `501` until validation, scheduling, loading, and
@@ -20,7 +27,7 @@ the router.
 Run locally with the project environment:
 
 ```sh
-uv run uvicorn --factory model_broker.application:create_app --host 127.0.0.1 --port 8000
+uv run uvicorn --app-dir src --factory model_broker.application:create_app --host 127.0.0.1 --port 8000
 ```
 
 The supplied [`.env.example`](.env.example) lists the current environment
@@ -144,7 +151,7 @@ uv run --isolated --no-project --python /usr/bin/python3 --with pytest \
   pytest -q tests/test_host_facts.py
 ```
 
-The systemd installation and migration test is deliberately opt-in. It uses a
+The systemd clean-install test is deliberately opt-in. It uses a
 privileged, network-isolated `docker run` container and never uses Docker
 Compose. Build its small local image first, then run the test:
 
@@ -153,7 +160,7 @@ docker build --file tests/systemd/Dockerfile --tag model-broker-systemd-test:loc
 MODEL_BROKER_RUN_SYSTEMD_INTEGRATION=1 uv run pytest -q tests/test_systemd_integration.py
 ```
 
-The integration test image uses Ubuntu 26.04 to match the broker host. The test
-creates a legacy `llama-supervisor.service`, runs the installer, verifies that the
-legacy service is stopped and disabled, verifies the new socket ownership and mode, and
-makes an `inventory` request.
+The integration test image uses Ubuntu 26.04 to match the broker host. It starts with no
+legacy services, runs the installer, verifies that systemd starts the helper and gives its
+socket the documented ownership and mode, then verifies that a client in the dedicated
+group can request both supported operations. It tests no migration path.
