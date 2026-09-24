@@ -62,11 +62,11 @@ a secrets mount, never committed in `.env`.
 
 ## Unified llama.cpp contract
 
-The `llama-cpp` container can see both CUDA devices. The router starts with the unified preset and `--no-models-autoload`. It does not receive router-wide placement arguments such as `--device`, `--split-mode`, `--main-gpu`, `--tensor-split`, or `--n-gpu-layers`: such arguments would override the placement encoded in an individual preset.
+The `llama-cpp` container can see both CUDA devices. The router starts with the unified preset and `--no-models-autoload`. It does not receive router-wide placement arguments such as `--device`, `--split-mode`, `--main-gpu`, `--tensor-split`, or `--n-gpu-layers`: such arguments would override the placement encoded in an individual preset. Router-driven idle sleeping or any other automatic model discard is disabled: the broker, not the router, decides when a loaded model leaves memory.
 
 The preset contains all effective settings for each model section. This is important because a model section is self-contained rather than relying on router-wide defaults. CPU-only variants use `device = none` and `n-gpu-layers = 0`; GPU variants declare their CUDA device(s), GPU layer count, and any tensor split themselves.
 
-The router has a small `models-max` limit (currently three) as a process-count backstop. It is not a resource scheduler: it neither understands which GPU a model occupies nor resolves an out-of-memory conflict. The broker makes those decisions before asking the router to load a model.
+The router has a small `models-max` limit (currently three) as a process-count backstop. It is not a resource scheduler: it neither understands which GPU a model occupies nor resolves an out-of-memory conflict. In normal operation the broker reserves this process-count capacity itself and explicitly unloads its chosen worker before it calls load, so the router's LRU-style fallback is never asked to choose a victim.
 
 At deployment time, verify the relation between `CUDA0`/`CUDA1` and physical cards with `llama-server --list-devices` in the image. The broker configuration uses those llama.cpp device identifiers, not a guessed PCI bus order.
 
@@ -194,6 +194,20 @@ After a load or unload it polls `GET /models` until the desired state is reporte
 
 `--no-models-autoload` is intentional. A direct request for an unloaded model returns the router's “model is not loaded” error rather than starting a worker behind the broker's back. The broker is the only component that calls load and unload.
 
+### Deferred router configuration verification
+
+Eventually, when `LlamaCppAdapter` attaches to a router and periodically while it remains attached, it will verify that the router has an acceptable configuration before admitting new inference work. This protects the broker's resource and residency decisions from a changed deployment or an incompatible router version.
+
+The verification profile includes at least:
+
+- autoload is disabled for all paths the broker uses;
+- automatic idle sleeping, autonomous eviction, or another router cleanup rule cannot discard a broker-resident worker;
+- `models-max` is configured as an agreed process-count backstop and the broker can reserve its slots before loading;
+- router-wide placement settings do not override the placement encoded in each preset; and
+- the router exposes the expected model-management API and preset catalogue.
+
+The exact verification mechanism depends on the pinned llama.cpp version and its safe configuration/status APIs. A router that cannot be verified, or whose observed configuration is unacceptable, is unhealthy for new scheduling work; the broker must not silently fall back to router-controlled autoload or eviction. Until this feature is implemented, deployment review and the pinned-router acceptance test enforce the same profile.
+
 ## Optional persistent KV-cache sessions
 
 The future orchestrator owns the real session: its messages, tool calls,
@@ -202,6 +216,10 @@ The broker may provide a persistent KV-cache as an optional acceleration. A KV
 cache is the model's computed attention state for a token prefix; it can avoid
 reprocessing an unchanged system prompt and conversation history. It is not a
 portable conversation format and cannot replace the orchestrator's record.
+
+Model residency is separate from a session. The broker may hold a bounded residency reservation for a model, but it stores no conversation content, tool state, or model-selection policy. An orchestrator may create, renew, and release such a reservation using an opaque identifier; ordinary API clients receive only the broker's default warm-residency treatment. The broker does not infer a conversation lifetime from that identifier and does not log it as a raw session identifier.
+
+A saved KV cache is also separate from residency. It can reduce prompt processing after a model has been unloaded and loaded again, but it does not keep model weights in VRAM and does not prevent replacement.
 
 The cache is valid only for the exact compatible model variant and runtime
 configuration. In particular, it must not be restored for another model,
@@ -289,27 +307,52 @@ pass-through handlers. If the router's schema cannot be fetched at startup,
 the explicit endpoints still start; generated routes are omitted and the
 failure is logged.
 
-## Scheduling and request lifecycle
+## Scheduling, residency, and request lifecycle
 
 There is one broker service. It is the central authority for scheduling
-significant compute on this host. It keeps track of loaded models and busy
-GPUs in its own memory. The design does not include broker replicas.
+significant compute on this host. It keeps track of loaded models, router
+process-count capacity, and resource claims in its own memory. The design does
+not include broker replicas.
+
+llama.cpp can host a model and route a request to it, but it cannot make this
+host's placement decision. Its model count is global rather than GPU-aware: it
+cannot know that a GPU1 model and a GPU0 model can remain loaded together, or
+that a request for another GPU1 model must make only the GPU1 worker a possible
+victim. Its request order and LRU behaviour are therefore not a scheduling
+policy for this deployment. The broker owns the resident set and makes every
+normal load and unload decision explicitly.
+
+The broker distinguishes three independent things:
+
+- An **execution lease** exists only while an inference request or stream is active. Its worker is never interrupted or selected for replacement.
+- A **residency reservation** keeps an otherwise idle worker loaded. It is a resource-management record, not a session. An orchestrator may own a protected reservation; a normal request creates an unprotected warm reservation.
+- A **resource claim** reserves the worker's GPU, CPU, RAM, and router process-count capacity while it is loaded, including while it is warm but idle.
+
+Warm residency is governed by configurable, explainable rules, not just one
+idle timeout. A deployment may consider time since use, measured load cost,
+recent demand, reservation priority, queued work, resource pressure, and other
+available operational data. The initial rule set may be time-based, but the
+broker API and state model must not assume that time is the only input.
 
 For each request, the broker:
 
 1. Authenticates the caller and resolves its requested preset ID to a validated `Variant`.
 2. Takes the scheduling lock and reconciles its state with `GET /models` when necessary.
-3. Reserves the variant's GPU and CPU class while deciding whether it can run.
-4. If it is not loaded, unloads incompatible *idle* workers, waits for their unloaded state, calls `/models/load`, and waits for it to be ready.
-5. Creates an active lease, releases the scheduling lock, and proxies the request or streaming response.
-6. Releases the lease only after the response stream ends, is cancelled, or fails. An idle cleanup task may unload a worker after its configured grace period and then releases its resource claim.
+3. Preserves every loaded worker whose claims do not conflict with the requested variant. It never removes an unrelated GPU0 worker merely to load a GPU1 worker.
+4. If the variant is not loaded, considers only idle, unprotected workers whose claims conflict with the request or whose router process-count slot is required. It selects an explicit victim according to the residency rules, unloads it, and waits for its unloaded state.
+5. If no eligible victim can make sufficient capacity, waits for the bounded request wait. It then returns `503 resource_busy` with `Retry-After`; it does not delegate the choice to router LRU.
+6. Reserves the requested variant's resource claims and router process-count slot, calls `/models/load`, and waits for it to be ready.
+7. Creates an execution lease, releases the scheduling lock, and proxies the request or streaming response.
+8. Releases the execution lease only after the response stream ends, is cancelled, or fails. It then creates or refreshes the applicable warm reservation; later cleanup follows the configured residency rules and releases the resource claim only when the worker is actually unloaded.
 
-An in-progress request is never interrupted to make room for another model. If
-the required GPU is busy, the broker waits for a short, configured time. If it
-does not become free, the broker returns `503 resource_busy` with
-`Retry-After`. A model with no current request may be replaced: the broker
-unloads it, observes that it is gone, then loads the requested variant. It
-never assumes that an unload is instantaneous.
+An in-progress request is never interrupted to make room for another model.
+Protected orchestrator reservations remain loaded until their expiry or
+explicit release. An unprotected warm worker may be replaced only when the
+residency rules permit it. The broker serialises conflicting replacement
+decisions and applies a bounded queue, so alternating requests cannot race in
+the router. The exact queueing and warm-residency rules may change with
+measurements, but their configured result—not llama.cpp's incidental request
+order—must decide whether to wait, replace a worker, or return `503`.
 
 This yields the expected basic policy:
 
@@ -317,11 +360,12 @@ This yields the expected basic policy:
 | --- | --- | --- |
 | `--cuda1` | `--cuda0` | May run concurrently. |
 | `--cuda0` | `--cuda1` | May run concurrently. |
+| warm `--cuda1` and warm `--cuda0` | another `--cuda1` | Preserve the GPU0 worker; wait, reject, or explicitly replace the eligible GPU1 worker under the residency rules. |
 | `--cuda1` | `--cuda0-cuda1` | Wait/reject while active; otherwise unload the GPU1 worker, then load dual-GPU. |
 | `--cuda0` or `--cuda1` | `--cuda0-cuda1` | Same: dual-GPU requires both cards. |
 | `--cuda0-cuda1` | any GPU variant | Wait/reject while dual-GPU lease is active. |
 
-Consequently, Flash Next on GPU1 can run with a less-than-16-GB GPU0 variant, and two less-than-16-GB variants can run simultaneously, one per card. An MoE variant with `n-cpu-moe` still has its declared GPU claim, plus its CPU class; the PCIe characteristics are accounted for by selecting the right preset ID, not by moving a loaded model at runtime.
+Consequently, Flash Next on GPU1 can run with a less-than-16-GB GPU0 variant, and two less-than-16-GB variants can remain loaded together. An MoE variant with `n-cpu-moe` still has its declared GPU claim, plus its CPU class; the PCIe characteristics are accounted for by selecting the right preset ID, not by moving a loaded model at runtime.
 
 CPU-only variants make no GPU claim. Their initial policy is conservative: variants with `n-cpu-moe > 0` are `moe_cpu` and consume a CPU-heavy scheduling slot. They do not run beside another CPU-heavy inference until measurements establish a safe capacity model. Pure CPU variants use the parsed thread settings and a small configurable CPU concurrency budget. This is a policy decision, not an assertion that llama.cpp itself reserves host CPU resources.
 
@@ -339,7 +383,9 @@ management, it polls `GET /models` and, where available, consumes
 `GET /models/sse`. This records each configured model's status
 (unloaded, loading, loaded, sleeping, or failed), observes completion of
 broker-requested loads and unloads, and reconciles the broker's resource
-claims after a router or broker restart.
+claims after a router or broker restart. A sleeping status is unexpected under
+the accepted router profile and marks the router unhealthy for new scheduling
+work until it is explained or corrected.
 
 The unified llama service enables its metrics endpoint. The adapter scrapes
 the router's model-scoped metrics as an input to operations and analytics,
@@ -382,3 +428,8 @@ The broker emits structured JSON logs for preset validation, load/unload transit
   host-facts service.
 - Coordination with ComfyUI, Ollama, or other external GPU users.
 - Additional OpenAI endpoints such as Responses API and non-llama backends.
+- Router-configuration verification and a pinned-router acceptance suite. It
+  must prove that autoload and autonomous discard are disabled, that a GPU0
+  worker remains loaded while a GPU1 worker is replaced, that active work is
+  not interrupted, and that alternating conflicting requests follow the broker
+  residency policy rather than router LRU.
