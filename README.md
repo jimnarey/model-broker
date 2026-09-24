@@ -15,7 +15,14 @@ adopts the models the router already holds. `GET /health` reports the number of
 models, those loaded, and any reason the broker cannot schedule: for example a
 router `--models-max` below the number of models that can be loaded together,
 autoload enabled, or an unreachable router. The broker still starts in that
-case, with status `degraded`.
+case, with status `degraded`, and checks the router again on the next request.
+
+The scheduler (`model_broker.scheduler`) loads a requested model at once when no
+loaded model competes for its resources. Otherwise the competing models must be
+idle before it unloads them: no running or queued requests, in the broker or in
+llama.cpp, and no use within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request waits
+up to `MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy`.
+The chat endpoint does not use the scheduler yet.
 `POST /v1/chat/completions` returns a broker-specific `501` until scheduling,
 loading, and proxying are implemented. See [the design](design.md) for the
 planned API.

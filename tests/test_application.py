@@ -150,3 +150,29 @@ def test_settings_require_the_preset_path(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("MODEL_BROKER_PRESET_PATH", raising=False)
     with pytest.raises(ValueError, match="MODEL_BROKER_PRESET_PATH must name"):
         Settings.from_environment()
+
+
+def test_settings_read_scheduling_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Protection window and maximum wait default to 300 s and 30 s; 0 is allowed."""
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    settings = Settings.from_environment()
+    assert (settings.idle_protect_seconds, settings.max_wait_seconds) == (300.0, 30.0)
+
+    monkeypatch.setenv("MODEL_BROKER_IDLE_PROTECT_SECONDS", "90")
+    monkeypatch.setenv("MODEL_BROKER_MAX_WAIT_SECONDS", "0")
+    settings = Settings.from_environment()
+    assert (settings.idle_protect_seconds, settings.max_wait_seconds) == (90.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [("soon", "must be a number of seconds"), ("-1", "must not be negative"), ("nan", "negative")],
+    ids=["not-a-number", "negative", "nan"],
+)
+def test_settings_reject_invalid_times(
+    monkeypatch: pytest.MonkeyPatch, value: str, error: str
+) -> None:
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    monkeypatch.setenv("MODEL_BROKER_MAX_WAIT_SECONDS", value)
+    with pytest.raises(ValueError, match=error):
+        Settings.from_environment()

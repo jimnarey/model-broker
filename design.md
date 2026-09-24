@@ -127,7 +127,7 @@ Every other path returns 404. Supporting another endpoint is a deliberate change
 
 ## Scheduling and request lifecycle
 
-There is one broker instance, and it is the only authority for loading and unloading models on this host. Proxying happens outside the scheduling lock; only load and unload decisions are serialised.
+There is one broker instance, and it is the only authority for loading and unloading models on this host. Decisions to unload and load are serialised by a scheduling lock. The unloads and loads themselves, and all proxying, happen outside it, so a long load of one model does not hold up a model that needs none of its resources.
 
 For each loaded model the broker keeps:
 
@@ -145,8 +145,8 @@ A model stays loaded until a request needs its resources. There is no idle unloa
    - **it is working**: the broker has active requests for it, or llama.cpp reports a processing slot or `requests_processing > 0`;
    - **it has queued work**: requests are waiting in the broker for it, or llama.cpp reports `requests_deferred > 0`; or
    - **it was active recently**: its last activity is within the idle protection window (`MODEL_BROKER_IDLE_PROTECT_SECONDS`), so an interactive user between turns keeps their model.
-4. While any conflicting model is busy, the request waits, up to the maximum wait (`MODEL_BROKER_MAX_WAIT_SECONDS`). A maximum wait of 0 refuses immediately. When the wait expires the broker returns `503 resource_busy` with `Retry-After`, based on when the protection window ends where that is the only obstacle.
-5. Once every conflicting model is displaceable, the broker takes the scheduling lock, unloads them, waits for each to report `unloaded`, loads the requested variant, and waits for `loaded`. It records the request as active and releases the lock before proxying.
+4. While any conflicting model is busy, the request waits, up to the maximum wait (`MODEL_BROKER_MAX_WAIT_SECONDS`). A maximum wait of 0 refuses immediately. When the wait expires the broker returns `503 resource_busy` with `Retry-After`, based on when the protection window ends where that is the only obstacle. The maximum wait covers only waiting for busy models, not the unload and load that follow.
+5. Once every conflicting model is displaceable, the broker decides, under the scheduling lock, to unload them and load the requested variant, then releases the lock. It unloads each one, waiting for `unloaded`, then loads the variant and waits for `loaded`. Until the router confirms an unload, the model still holds its resources, so no other decision can place a model on a GPU that is being freed; a model being loaded counts as busy. It then records the request as active and proxies it.
 6. When the response or stream ends, is cancelled, or fails, the broker decrements the active count, updates last activity, and wakes waiting requests.
 
 An in-progress request is never interrupted to make room for another model.
@@ -155,7 +155,7 @@ A loaded model's own requests keep being admitted while another model waits for 
 
 ### Observing llama.cpp
 
-The broker's own counts cover every request that passes through it. It also asks llama.cpp, because work can reach the router without the broker (for example while clients migrate), and because the router's queue is the authority on what it has accepted. The broker reads `GET /slots?model=` and `GET /metrics?model=` for a conflicting model whenever a scheduling decision depends on it, not on a timer. If the router's token counters have advanced since the previous observation, that also counts as recent activity.
+The broker's own counts cover every request that passes through it. It also asks llama.cpp, because work can reach the router without the broker (for example while clients migrate), and because the router's queue is the authority on what it has accepted. The broker reads `GET /slots?model=` and `GET /metrics?model=` for a conflicting model whenever a scheduling decision depends on it, not on a timer. If the router's decode counter (`n_decode_total`, which rises during prompt processing and generation) has advanced since the previous observation, the model counts as active at the time of that observation: the broker cannot tell when the work ended, so it assumes the latest possible time.
 
 If an observation fails, the model is treated as busy. The broker never unloads a model it cannot see is idle.
 

@@ -18,14 +18,27 @@ import httpx
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from model_broker.catalogue import Variant, load_catalogue
+from model_broker.catalogue import load_catalogue
 from model_broker.llama import LlamaAdapter
-from model_broker.scheduler import RouterView, inspect_router
+from model_broker.scheduler import Scheduler, inspect_router
 
 LOGGER = logging.getLogger(__name__)
 # Bounds each router control and observation request; inference has its own timeout.
 ROUTER_TIMEOUT_SECONDS = 10.0
 JsonObject = dict[str, object]
+
+
+def seconds_setting(name: str, default: float) -> float:
+    """Read a non-negative number of seconds from the environment."""
+    text = os.environ.get(name)
+    try:
+        value = float(text) if text else default
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number of seconds, not {text!r}") from error
+    # "not >=" rather than "<" so that NaN is rejected too.
+    if not value >= 0:
+        raise ValueError(f"{name} must not be negative")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +47,10 @@ class Settings:
 
     llama_url: str
     preset_path: Path
+    # How long a model stays protected from unloading after it was last used.
+    idle_protect_seconds: float = 300.0
+    # How long a request waits for busy conflicting models before a 503.
+    max_wait_seconds: float = 30.0
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -41,7 +58,12 @@ class Settings:
         preset_path = os.environ.get("MODEL_BROKER_PRESET_PATH")
         if not preset_path:
             raise ValueError("MODEL_BROKER_PRESET_PATH must name the mounted llama.cpp preset")
-        return cls(llama_url=llama_url.rstrip("/"), preset_path=Path(preset_path))
+        return cls(
+            llama_url=llama_url.rstrip("/"),
+            preset_path=Path(preset_path),
+            idle_protect_seconds=seconds_setting("MODEL_BROKER_IDLE_PROTECT_SECONDS", 300.0),
+            max_wait_seconds=seconds_setting("MODEL_BROKER_MAX_WAIT_SECONDS", 30.0),
+        )
 
 
 def not_implemented(message: str, code: str) -> JSONResponse:
@@ -56,11 +78,11 @@ router = APIRouter(tags=["broker"])
 @router.get("/health")
 async def health(request: Request) -> JsonObject:
     """Report the catalogue, the models the router holds, and why the broker cannot schedule."""
-    catalogue = cast(dict[str, Variant], request.app.state.catalogue)
-    view = cast(RouterView, request.app.state.router_view)
+    scheduler = cast(Scheduler, request.app.state.scheduler)
+    view = scheduler.view
     return {
         "status": "degraded" if view.problems else "ok",
-        "models": len(catalogue),
+        "models": len(scheduler.catalogue),
         "loaded": sorted(view.loaded),
         "router": {"build": view.build, "problems": view.problems},
     }
@@ -106,9 +128,14 @@ def create_app(
             LOGGER.info(
                 "catalogue has %s models; router holds %s", len(catalogue), sorted(view.loaded)
             )
-            app.state.catalogue = catalogue
-            app.state.adapter = adapter
-            app.state.router_view = view
+            app.state.scheduler = Scheduler(
+                adapter,
+                catalogue,
+                view,
+                protect_seconds=configured.idle_protect_seconds,
+                max_wait_seconds=configured.max_wait_seconds,
+                clock=clock,
+            )
             yield
 
     app = FastAPI(
