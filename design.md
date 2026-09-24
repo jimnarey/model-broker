@@ -381,7 +381,8 @@ than treating it as a binary conflict.
 `LlamaCppAdapter` monitors the router independently of client requests. For
 management, it polls `GET /models` and, where available, consumes
 `GET /models/sse`. This records each configured model's status
-(unloaded, loading, loaded, sleeping, or failed), observes completion of
+(unloaded, loading, loaded, or sleeping; the pinned router reports a failed
+load as unloaded with `failed: true` and the worker's exit code), observes completion of
 broker-requested loads and unloads, and reconciles the broker's resource
 claims after a router or broker restart. A sleeping status is unexpected under
 the accepted router profile and marks the router unhealthy for new scheduling
