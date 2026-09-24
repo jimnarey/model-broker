@@ -5,10 +5,11 @@ Run with ``uvicorn --factory model_broker.application:create_app``.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from model_broker.auth import ApiKeys, client_for, load_api_keys
-from model_broker.catalogue import load_catalogue
+from model_broker.catalogue import Variant, load_catalogue
 from model_broker.events import (
     LEVELS,
     REQUEST,
@@ -31,7 +32,15 @@ from model_broker.events import (
 )
 from model_broker.instrumentation import ROUTER_EVENT_HOOKS, RequestEvents
 from model_broker.llama import LlamaAdapter
-from model_broker.scheduler import Scheduler, inspect_router
+from model_broker.proxy import ProxiedChat
+from model_broker.scheduler import (
+    LoadFailed,
+    ResourceBusy,
+    Scheduler,
+    SchedulerError,
+    UnknownModel,
+    inspect_router,
+)
 
 # Bounds each router control and observation request; inference has its own timeout.
 ROUTER_TIMEOUT_SECONDS = 10.0
@@ -97,10 +106,42 @@ def log_level_setting() -> str:
     return level
 
 
-def not_implemented(message: str, code: str) -> JSONResponse:
-    """Return a 501 response in the OpenAI error shape."""
-    error = {"message": message, "type": "not_implemented", "code": code}
-    return JSONResponse(status_code=501, content={"error": error})
+def openai_error(
+    status: int,
+    message: str,
+    code: str,
+    error_type: str = "invalid_request_error",
+    param: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """Return an error in OpenAI's shape, which OpenAI client libraries understand."""
+    error = {"message": message, "type": error_type, "param": param, "code": code}
+    return JSONResponse(status_code=status, content={"error": error}, headers=headers)
+
+
+def model_not_found(model: str) -> JSONResponse:
+    return openai_error(
+        404, f"The model {model!r} does not exist.", "model_not_found", param="model"
+    )
+
+
+def refusal(error: SchedulerError, model: str) -> JSONResponse:
+    """The response for a request the scheduler would not admit."""
+    match error:
+        case UnknownModel():
+            return model_not_found(model)
+        case ResourceBusy():
+            return openai_error(
+                503,
+                f"The resources for {model!r} are busy: {error}",
+                "resource_busy",
+                "server_error",
+                headers={"Retry-After": str(error.retry_after)},
+            )
+        case LoadFailed():
+            return openai_error(502, str(error), "model_load_failed", "server_error")
+        case _:
+            return openai_error(503, str(error), "router_unavailable", "server_error")
 
 
 class Unauthenticated(Exception):
@@ -109,14 +150,12 @@ class Unauthenticated(Exception):
 
 def unauthenticated(_: Request, __: Exception) -> JSONResponse:
     """Answer as OpenAI does for a missing or wrong API key."""
-    error = {
-        "message": "Missing or invalid API key. Send it as 'Authorization: Bearer <key>'.",
-        "type": "invalid_request_error",
-        "param": None,
-        "code": "invalid_api_key",
-    }
-    headers = {"WWW-Authenticate": "Bearer"}
-    return JSONResponse(status_code=401, content={"error": error}, headers=headers)
+    return openai_error(
+        401,
+        "Missing or invalid API key. Send it as 'Authorization: Bearer <key>'.",
+        "invalid_api_key",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def authenticate(request: Request) -> None:
@@ -156,19 +195,51 @@ async def health(request: Request) -> JsonObject:
     }
 
 
-@api.post(
-    "/chat/completions",
-    status_code=501,
-    summary="Broker-owned chat completions",
-    responses={501: {"description": "Scheduling and proxying are not implemented yet."}},
-)
-async def chat_completions() -> JSONResponse:
-    """Reserve the chat endpoint for validation, scheduling, and proxying."""
-    return not_implemented(
-        "Chat completions are broker-owned and require scheduling support that is not "
-        "implemented yet.",
-        "broker_scheduling_not_implemented",
-    )
+def model_object(variant: Variant, created: int) -> JsonObject:
+    """A catalogue variant in OpenAI's model shape."""
+    return {"id": variant.id, "object": "model", "created": created, "owned_by": "model-broker"}
+
+
+@api.get("/models")
+async def list_models(request: Request) -> JsonObject:
+    """Every model in the catalogue, loaded or not."""
+    scheduler = cast(Scheduler, request.app.state.scheduler)
+    created = cast(int, request.app.state.started)
+    data = [model_object(variant, created) for variant in scheduler.catalogue.values()]
+    return {"object": "list", "data": data}
+
+
+@api.get("/models/{model}", response_model=None)
+async def get_model(model: str, request: Request) -> JsonObject | JSONResponse:
+    scheduler = cast(Scheduler, request.app.state.scheduler)
+    variant = scheduler.catalogue.get(model)
+    if variant is None:
+        return model_not_found(model)
+    return model_object(variant, cast(int, request.app.state.started))
+
+
+@api.post("/chat/completions", response_model=None)
+async def chat_completions(request: Request) -> ProxiedChat | JSONResponse:
+    """Schedule the requested model, then proxy the request and the router's response.
+
+    The body is forwarded unchanged. The admission is taken before responding, so that a
+    refusal gets its own status; it is released when the proxied response ends, however
+    it ends.
+    """
+    try:
+        payload: object = json.loads(await request.body())
+    except ValueError:
+        return openai_error(400, "The request body must be JSON.", "invalid_json")
+    model = cast(JsonObject, payload).get("model") if isinstance(payload, dict) else None
+    if not isinstance(model, str) or not model:
+        return openai_error(400, "The request must name a model.", "missing_model", param="model")
+    scheduler = cast(Scheduler, request.app.state.scheduler)
+    resources = AsyncExitStack()
+    try:
+        await resources.enter_async_context(scheduler.admit(model))
+    except SchedulerError as error:
+        return refusal(error, model)
+    return ProxiedChat(scheduler.adapter, cast(JsonObject, payload), model, resources)
 
 
 def create_app(
@@ -212,6 +283,7 @@ def create_app(
                 clock=clock,
             )
             await app.state.scheduler.start()
+            app.state.started = int(time.time())
             emit(BrokerStarted(len(catalogue), sorted(view.loaded), view.build))
             yield
 

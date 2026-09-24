@@ -259,6 +259,38 @@ class BaselineRecorded(Event):
     decode_calls: int | None
 
 
+# Proxying
+
+
+@dataclass(frozen=True, slots=True)
+class ClientDisconnected(Event):
+    """The client left before the router's response finished; the router request was
+    closed, which stops llama.cpp working on it."""
+
+    model: str
+    seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyFailed(Event):
+    """The router could not be reached, or its response broke off part-way."""
+
+    level = logging.ERROR
+    model: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyFinished(Event):
+    """The router's whole response reached the client."""
+
+    level = logging.DEBUG
+    model: str
+    status: int
+    bytes: int
+    seconds: float
+
+
 # HTTP
 
 

@@ -8,16 +8,13 @@ fractions of a second.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from model_broker.catalogue import load_catalogue
 from model_broker.events import (
     Event,
     ModelLoaded,
@@ -43,74 +40,7 @@ from model_broker.scheduler import (
     inspect_router,
 )
 
-# Real sections from the unified preset.
-CATALOGUE = load_catalogue(Path(__file__).parent / "fixtures" / "models-preset.ini")
-CUDA0 = "qwen2.5-coder-7b-instruct-q4_k_m--cuda0"
-CUDA1 = "qwen2.5-coder-7b-instruct-q4_k_m--cuda1"
-MOE_CUDA1 = "GLM-4.5-Air-UD-Q4_K_XL--cuda1"
-DUAL = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0--cuda0-cuda1"
-GOOD_PROPS = {"role": "router", "max_instances": 3, "models_autoload": False, "build_info": "b1"}
-
-
-class FakeRouter:
-    """An in-memory llama.cpp router with the endpoints the scheduler uses.
-
-    Loads and unloads finish at once unless ``loads_finish`` or ``unloads_finish`` is
-    cleared, in which case the model reports ``loading``, or stays ``loaded``, until it is
-    set. ``fail`` holds (action, model) pairs whose control request is refused with a 500.
-    """
-
-    def __init__(self, loaded: tuple[str, ...] = (), loading: tuple[str, ...] = ()) -> None:
-        self.props = dict(GOOD_PROPS)
-        self.states = {model: "loaded" if model in loaded else "unloaded" for model in CATALOGUE}
-        self.states.update(dict.fromkeys(loading, "loading"))
-        self.processing: set[str] = set()
-        self.deferred: dict[str, int] = {}
-        self.decode_calls: dict[str, int] = {}
-        self.observable = True
-        self.fail: set[tuple[str, str]] = set()
-        self.calls: list[tuple[str, str]] = []
-        self.loads_finish = asyncio.Event()
-        self.loads_finish.set()
-        self.unloads_finish = asyncio.Event()
-        self.unloads_finish.set()
-        self.unloading: set[str] = set()
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/props":
-            return httpx.Response(200, json=self.props)
-        if path == "/models":
-            if self.loads_finish.is_set():
-                self.states = {m: "loaded" if s == "loading" else s for m, s in self.states.items()}
-            if self.unloads_finish.is_set():
-                self.states.update(dict.fromkeys(self.unloading, "unloaded"))
-                self.unloading.clear()
-            data = [{"id": m, "status": {"value": s}} for m, s in self.states.items()]
-            return httpx.Response(200, json={"data": data})
-        if path in ("/slots", "/metrics"):
-            return self.observe(path, request.url.params["model"])
-        action, model = path.removeprefix("/models/"), json.loads(request.content)["model"]
-        self.calls.append((action, model))
-        if (action, model) in self.fail:
-            return httpx.Response(500, text="refused")
-        if action == "load":
-            self.states[model] = "loading"
-        else:
-            self.unloading.add(model)
-        return httpx.Response(200, json={"success": True})
-
-    def observe(self, path: str, model: str) -> httpx.Response:
-        if not self.observable:
-            return httpx.Response(500, text="unavailable")
-        if path == "/slots":
-            return httpx.Response(200, json=[{"id": 0, "is_processing": model in self.processing}])
-        metrics = (
-            f"llamacpp:requests_processing {int(model in self.processing)}\n"
-            f"llamacpp:requests_deferred {self.deferred.get(model, 0)}\n"
-            f"llamacpp:n_decode_total {self.decode_calls.get(model, 0)}\n"
-        )
-        return httpx.Response(200, text=metrics)
+from .fake_router import CATALOGUE, CUDA0, CUDA1, DUAL, MOE_CUDA1, FakeRouter
 
 
 def run(

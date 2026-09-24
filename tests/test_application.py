@@ -23,6 +23,8 @@ from model_broker.events import (
     RouterCalled,
 )
 
+from .fake_router import FakeRouter
+
 PRESET = Path(__file__).parent / "fixtures" / "models-preset.ini"
 SETTINGS = Settings("http://router.test", PRESET)
 CUDA0 = "qwen2.5-coder-7b-instruct-q4_k_m--cuda0"
@@ -128,16 +130,6 @@ def test_invalid_preset_stops_startup(tmp_path: Path) -> None:
 # Endpoints
 
 
-def test_chat_completions_is_not_implemented_yet() -> None:
-    """Chat returns the broker's own 501 in the OpenAI error shape until scheduling exists."""
-    response = broker_request(
-        lambda client: client.post("/v1/chat/completions", json={"model": "example"})
-    )
-
-    assert response.status_code == 501
-    assert response.json()["error"]["code"] == "broker_scheduling_not_implemented"
-
-
 @pytest.mark.parametrize(
     ("method", "path"),
     [("POST", "/v1/embeddings"), ("GET", "/slots"), ("POST", "/models/load")],
@@ -155,7 +147,7 @@ def test_unsupported_paths_return_404(method: str, path: str) -> None:
 # Authentication
 
 KEY = "test-key-for-vscode"
-CHAT = {"model": "example"}
+CHAT = {"model": CUDA0, "messages": [{"role": "user", "content": "hi"}]}
 
 
 def with_keys(tmp_path: Path) -> Settings:
@@ -166,8 +158,10 @@ def with_keys(tmp_path: Path) -> Settings:
 
 
 def chat(settings: Settings, headers: dict[str, str]) -> httpx.Response:
+    """Send one chat request for CUDA0 to a broker whose router is a FakeRouter."""
     return broker_request(
         lambda client: client.post("/v1/chat/completions", json=CHAT, headers=headers),
+        FakeRouter().handle,
         settings=settings,
     )
 
@@ -180,10 +174,9 @@ def chat(settings: Settings, headers: dict[str, str]) -> httpx.Response:
 def test_without_keys_file_every_request_is_accepted(headers: dict[str, str]) -> None:
     """With authentication off, a request reaches the endpoint with or without a key.
 
-    Many OpenAI clients always send some key, so a placeholder must not be refused. The
-    endpoint's own 501 shows that the request got past authentication.
+    Many OpenAI clients always send some key, so a placeholder must not be refused.
     """
-    assert chat(SETTINGS, headers).status_code == 501
+    assert chat(SETTINGS, headers).status_code == 200
 
 
 def test_authentication_off_is_warned_about(events: Callable[[], list[Event]]) -> None:
@@ -214,7 +207,7 @@ def test_with_keys_file_a_request_without_a_valid_key_is_refused(
 
 def test_with_keys_file_a_valid_key_reaches_the_endpoint(tmp_path: Path) -> None:
     response = chat(with_keys(tmp_path), {"Authorization": f"Bearer {KEY}"})
-    assert response.status_code == 501
+    assert response.status_code == 200
 
 
 def test_health_needs_no_key(tmp_path: Path) -> None:
@@ -264,7 +257,7 @@ def test_each_request_is_logged_with_its_id_and_client(
     ]
 
     assert received == RequestReceived("POST", "/v1/chat/completions")
-    assert isinstance(completed, RequestCompleted) and completed.status == 501
+    assert isinstance(completed, RequestCompleted) and completed.status == 200
     assert first.request_id == last.request_id and last.client == "vscode"
 
 

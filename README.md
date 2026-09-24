@@ -3,10 +3,10 @@
 A broker service for managing llama requests requiring different models
 with different resource requirements.
 
-**Status:** the broker starts, validates the preset, checks the router, and
-schedules model loads, with optional API keys. The chat endpoint does not yet
-use the scheduler or proxy requests, and `/v1/models` does not exist yet; see
-[the design](design.md) for the planned API.
+**Status:** the broker validates the preset, checks the router, lists the
+catalogue at `/v1/models`, and schedules and proxies `POST /v1/chat/completions`
+(JSON and streamed), with optional API keys. Other OpenAI endpoints return 404;
+see [the design](design.md).
 
 ## Broker API
 
@@ -27,7 +27,13 @@ loaded model competes for its resources. Otherwise the competing models must be
 idle before it unloads them: no running or queued requests, in the broker or in
 llama.cpp, and no use within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request waits
 up to `MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy`.
-The chat endpoint does not use the scheduler yet.
+`POST /v1/chat/completions` is admitted by the scheduler, then forwarded
+unchanged, and the router's response is relayed as it arrives, streams
+included. Router errors reach the client unchanged. A refusal is an OpenAI-style
+error: 404 `model_not_found`, 503 `resource_busy` with `Retry-After`, 503
+`router_unavailable`, or 502 `model_load_failed`. When a client disconnects, the
+broker closes the router request, so llama.cpp stops generating, and releases
+the model at once.
 
 ### Logging
 
