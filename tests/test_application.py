@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from model_broker.application import Settings, create_app
+from model_broker.auth import ApiKeysError
 from model_broker.catalogue import CatalogueError
 
 PRESET = Path(__file__).parent / "fixtures" / "models-preset.ini"
@@ -62,6 +63,7 @@ def test_health_reports_catalogue_and_loaded_models() -> None:
         "models": 5,
         "loaded": [CUDA0],
         "router": {"build": "b1", "problems": []},
+        "authentication": "off",
     }
 
 
@@ -131,6 +133,88 @@ def test_unsupported_paths_return_404(method: str, path: str) -> None:
     assert response.status_code == 404
 
 
+# Authentication
+
+KEY = "test-key-for-vscode"
+CHAT = {"model": "example"}
+
+
+def with_keys(tmp_path: Path) -> Settings:
+    """Settings with authentication on, for one client ``vscode`` holding ``KEY``."""
+    keys_file = tmp_path / "api-keys"
+    keys_file.write_text(f"vscode {KEY}\n")
+    return Settings("http://router.test", PRESET, api_keys_file=keys_file)
+
+
+def chat(settings: Settings, headers: dict[str, str]) -> httpx.Response:
+    return broker_request(
+        lambda client: client.post("/v1/chat/completions", json=CHAT, headers=headers),
+        settings=settings,
+    )
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer sk-no-key-required"}],
+    ids=["no-key", "placeholder-key"],
+)
+def test_without_keys_file_every_request_is_accepted(headers: dict[str, str]) -> None:
+    """With authentication off, a request reaches the endpoint with or without a key.
+
+    Many OpenAI clients always send some key, so a placeholder must not be refused. The
+    endpoint's own 501 shows that the request got past authentication.
+    """
+    assert chat(SETTINGS, headers).status_code == 501
+
+
+def test_authentication_off_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
+    """Running without keys is allowed, but startup says so."""
+    broker_request(lambda client: client.get("/health"))
+    assert "authentication is off" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer test-key-for-vscodX"}, {"Authorization": f"Basic {KEY}"}],
+    ids=["no-key", "wrong-key", "wrong-scheme"],
+)
+def test_with_keys_file_a_request_without_a_valid_key_is_refused(
+    tmp_path: Path, headers: dict[str, str]
+) -> None:
+    """With authentication on, a missing or wrong key gets OpenAI's 401 before the endpoint.
+
+    OpenAI clients recognise ``invalid_api_key``; ``WWW-Authenticate`` tells other HTTP
+    clients which scheme to use.
+    """
+    response = chat(with_keys(tmp_path), headers)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_with_keys_file_a_valid_key_reaches_the_endpoint(tmp_path: Path) -> None:
+    response = chat(with_keys(tmp_path), {"Authorization": f"Bearer {KEY}"})
+    assert response.status_code == 501
+
+
+def test_health_needs_no_key(tmp_path: Path) -> None:
+    """/health stays open so that the container health check needs no secret."""
+    response = broker_request(lambda client: client.get("/health"), settings=with_keys(tmp_path))
+
+    assert response.status_code == 200
+    assert response.json()["authentication"] == "on"
+
+
+def test_invalid_keys_file_stops_startup(tmp_path: Path) -> None:
+    keys_file = tmp_path / "api-keys"
+    keys_file.write_text("vscode short\n")
+    settings = Settings("http://router.test", PRESET, api_keys_file=keys_file)
+
+    with pytest.raises(ApiKeysError, match="shorter than 16"):
+        broker_request(lambda client: client.get("/health"), settings=settings)
+
+
 # Settings
 
 
@@ -176,3 +260,13 @@ def test_settings_reject_invalid_times(
     monkeypatch.setenv("MODEL_BROKER_MAX_WAIT_SECONDS", value)
     with pytest.raises(ValueError, match=error):
         Settings.from_environment()
+
+
+def test_settings_read_the_api_keys_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The keys file is optional: unset means authentication is off."""
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    monkeypatch.delenv("MODEL_BROKER_API_KEYS_FILE", raising=False)
+    assert Settings.from_environment().api_keys_file is None
+
+    monkeypatch.setenv("MODEL_BROKER_API_KEYS_FILE", "/run/secrets/broker-api-keys")
+    assert Settings.from_environment().api_keys_file == Path("/run/secrets/broker-api-keys")

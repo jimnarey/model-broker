@@ -23,6 +23,26 @@ idle before it unloads them: no running or queued requests, in the broker or in
 llama.cpp, and no use within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request waits
 up to `MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy`.
 The chat endpoint does not use the scheduler yet.
+
+### Authentication
+
+API keys are optional. Without `MODEL_BROKER_API_KEYS_FILE`, authentication is
+off: every request is accepted, any key a client sends is ignored, startup logs
+a warning, and `/health` reports `"authentication": "off"`. To turn it on, give
+each client its own key in a secrets file and point the setting at it:
+
+```text
+# client-name  key (generate each key with: openssl rand -hex 24)
+vscode            <key>
+deepseek-harness  <key>
+```
+
+Comments must be on their own line.
+
+Every `/v1/` request then needs `Authorization: Bearer <key>`; a missing or
+wrong key gets OpenAI's `401 invalid_api_key`. `/health` needs no key. The file
+is read at startup, so restart the broker after changing it. Keys cross the
+network in plain HTTP until the broker is behind a TLS proxy.
 `POST /v1/chat/completions` returns a broker-specific `501` until scheduling,
 loading, and proxying are implemented. See [the design](design.md) for the
 planned API.
