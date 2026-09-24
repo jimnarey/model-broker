@@ -225,3 +225,33 @@ The integration test image uses Ubuntu 26.04 to match the broker host. It starts
 legacy services, runs the installer, verifies that systemd starts the helper and gives its
 socket the documented ownership and mode, then verifies that a client in the dedicated
 group can request both supported operations. It tests no migration path.
+
+### Acceptance tests
+
+`tests/acceptance` proves the broker against a real llama.cpp router on the GPUs,
+over HTTP: models on different GPUs stay loaded together, only the conflicting
+model is unloaded, a dual-GPU model replaces both single-GPU models, an active
+stream is never interrupted, recent use is protected, work sent straight to the
+router is respected, a client disconnecting stops generation, and a restarted
+broker keeps the loaded models.
+
+They run against a router image built by this repository, from the commit
+pinned in [`tests/acceptance/llama.env`](tests/acceptance/llama.env); keep it at
+the commit the deployment runs. Build it once per commit (it compiles
+llama.cpp with CUDA, which takes a while):
+
+```sh
+tests/acceptance/build-router.sh
+```
+
+The tests start that router in their own container, on localhost, with the
+broker's settings, and a broker process per test. They choose the smallest
+suitable models from the preset they are given. Both GPUs must be idle, so
+unload any models from the deployment's router first.
+
+```sh
+MODEL_BROKER_RUN_ACCEPTANCE=1 \
+MODEL_BROKER_ACCEPTANCE_PRESET=/path/to/unified/models-preset.ini \
+MODEL_BROKER_ACCEPTANCE_MODELS=/path/to/models \
+uv run pytest -q tests/acceptance
+```
