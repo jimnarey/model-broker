@@ -94,20 +94,22 @@ def test_managed_resources_come_from_the_preset(real: dict[str, Variant]) -> Non
         ([CUDA0, CUDA1, MOE_CUDA1, DUAL, CPU], 3),
         ([CUDA0, CUDA1], 2),
         ([CUDA0, CPU], 2),
-        ([CUDA0, DUAL], 2),
+        ([CUDA0, DUAL], 1),
+        ([DUAL], 1),
+        ([CUDA1, MOE_CUDA1, CPU], 2),
     ],
-    ids=["whole-fixture", "one-model-per-gpu", "gpu-and-cpu", "dual-gpu"],
+    ids=["whole-fixture", "one-model-per-gpu", "gpu-and-cpu", "gpu0-or-dual", "dual-only", "moe"],
 )
-def test_max_loaded_models_counts_exclusive_resources(
+def test_max_loaded_models_is_the_largest_group_without_conflict(
     real: dict[str, Variant], variant_ids: list[str], limit: int
 ) -> None:
-    """The most models that can be loaded together is the number of exclusive resources.
+    """The limit is the most models that can be loaded at once, not a count of resources.
 
-    Each loaded model holds at least one exclusive resource that no other loaded model can
-    hold. ``whole-fixture`` has GPU0, GPU1 and RAM:weights, so 3: for example CUDA0, CUDA1
-    and CPU together. ``dual-gpu`` gives 2 although at most one of its models can be loaded
-    at a time: the bound counts resources, not the models available to fill them, and a
-    router limit above the true maximum does no harm.
+    ``whole-fixture``: CUDA0, CUDA1 and CPU can all be loaded, so 3. ``gpu0-or-dual`` and
+    ``dual-only`` have two exclusive resources (GPU0 and GPU1) but the dual model needs both,
+    so only one model fits; counting resources would wrongly demand models-max 2. ``moe``:
+    the MoE model on GPU1 conflicts with CUDA1 (GPU1) and with CPU (RAM:weights), so the
+    best is CUDA1 with CPU, 2.
     """
     catalogue = {variant_id: real[variant_id] for variant_id in variant_ids}
     assert max_loaded_models(catalogue) == limit

@@ -46,9 +46,10 @@ class FakeRouter:
     set. ``fail`` holds (action, model) pairs whose control request is refused with a 500.
     """
 
-    def __init__(self, loaded: tuple[str, ...] = ()) -> None:
+    def __init__(self, loaded: tuple[str, ...] = (), loading: tuple[str, ...] = ()) -> None:
         self.props = dict(GOOD_PROPS)
         self.states = {model: "loaded" if model in loaded else "unloaded" for model in CATALOGUE}
+        self.states.update(dict.fromkeys(loading, "loading"))
         self.processing: set[str] = set()
         self.deferred: dict[str, int] = {}
         self.decode_calls: dict[str, int] = {}
@@ -103,13 +104,14 @@ def run(
     body: Callable[[Scheduler], Awaitable[None]],
     protect: float = 0.0,
     max_wait: float = 0.0,
+    load_timeout: float = 60.0,
 ) -> None:
     """Start a scheduler against ``router``, adopting its loaded models, and run ``body``."""
 
     async def main() -> None:
         transport = httpx.MockTransport(router.handle)
         async with httpx.AsyncClient(transport=transport, base_url="http://router.test") as client:
-            adapter = LlamaAdapter(client, poll_interval_seconds=0.005)
+            adapter = LlamaAdapter(client, load_timeout, poll_interval_seconds=0.005)
             view = await inspect_router(adapter, CATALOGUE, time.monotonic())
             scheduler = Scheduler(
                 adapter,
@@ -119,6 +121,7 @@ def run(
                 max_wait_seconds=max_wait,
                 poll_seconds=0.01,
             )
+            await scheduler.start()
             await body(scheduler)
 
     asyncio.run(main())
@@ -308,7 +311,70 @@ def test_decode_count_advancing_counts_as_recent_use() -> None:
     run(router, body, protect=0.3)
 
 
+def test_direct_work_before_the_first_check_is_noticed() -> None:
+    """Work that bypassed the broker between startup and its first check still counts.
+
+    Setup: CUDA1 is adopted with decode count 10, recorded at startup. The 0.2 s window
+    passes; then a client calls the router directly, raising the count to 50, and finishes
+    before the broker looks. Expect the request for MOE_CUDA1 to be refused as recently
+    used. Without the startup baseline, the first check would only record 50 and see
+    nothing.
+    """
+    router = FakeRouter(loaded=(CUDA1,))
+    router.decode_calls[CUDA1] = 10
+
+    async def body(scheduler: Scheduler) -> None:
+        await asyncio.sleep(0.25)
+        router.decode_calls[CUDA1] = 50
+        with pytest.raises(ResourceBusy, match="used recently"):
+            await admitted(scheduler, MOE_CUDA1)
+
+    run(router, body, protect=0.2)
+
+
+def test_an_unknown_decode_count_counts_as_recent_use() -> None:
+    """If the baseline could not be read, the first check assumes unseen work.
+
+    Setup: the router cannot be observed at startup, so CUDA1 has no baseline. After the
+    window has passed and observation works again, the first check must not conclude that
+    CUDA1 is idle.
+    """
+    router = FakeRouter(loaded=(CUDA1,))
+    router.observable = False
+
+    async def body(scheduler: Scheduler) -> None:
+        await asyncio.sleep(0.25)
+        router.observable = True
+        with pytest.raises(ResourceBusy, match="used recently"):
+            await admitted(scheduler, MOE_CUDA1)
+
+    run(router, body, protect=0.2)
+
+
 # Loading, queueing and order
+
+
+def test_a_model_found_loading_at_startup_is_waited_for() -> None:
+    """A model the router is loading when the broker starts is not ready, but holds GPU1.
+
+    Expect a request for it to wait for the load, and a request for MOE_CUDA1, which also
+    needs GPU1, to be refused meanwhile rather than unload a model still loading.
+    """
+    router = FakeRouter(loading=(CUDA1,))
+    router.loads_finish.clear()
+
+    async def body(scheduler: Scheduler) -> None:
+        waiting = asyncio.create_task(admitted(scheduler, CUDA1))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        with pytest.raises(ResourceBusy, match="loading"):
+            await admitted(scheduler, MOE_CUDA1)
+
+        router.loads_finish.set()
+        assert await waiting == CUDA1
+
+    run(router, body)
+    assert router.calls == []
 
 
 def test_requests_for_the_same_model_share_one_load() -> None:
@@ -481,6 +547,44 @@ def test_failed_load_fails_every_request_waiting_for_it() -> None:
 
     run(router, body)
     assert router.calls == [("load", CUDA1)]
+
+
+def test_a_timed_out_load_keeps_its_resources() -> None:
+    """A load that times out may still be running, so its model keeps its GPU.
+
+    Setup: CUDA0 is serving a request, and loading CUDA1 outlasts the 0.1 s load timeout.
+    Expect:
+    - the request for CUDA1 fails, but CUDA1 stays in the loaded set, and the router is
+      marked unfit because the broker cannot confirm where CUDA1 is;
+    - the next request makes the broker check the router again. It still reports CUDA1
+      loading, so a request for MOE_CUDA1, which also needs GPU1, is refused rather than
+      loaded onto a card that CUDA1 may be filling;
+    - the check keeps CUDA0's record, so its running request is still counted.
+    """
+    router = FakeRouter(loaded=(CUDA0,))
+    router.loads_finish.clear()
+
+    async def body(scheduler: Scheduler) -> None:
+        first_ends = asyncio.Event()
+        first = asyncio.create_task(hold(scheduler, CUDA0, first_ends))
+        await asyncio.sleep(0.02)
+        serving = scheduler.loaded[CUDA0]
+
+        with pytest.raises(LoadFailed, match="did not become 'loaded'"):
+            await admitted(scheduler, CUDA1)
+        assert CUDA1 in scheduler.loaded
+        assert "not confirmed it is unloaded" in scheduler.view.problems[0]
+
+        with pytest.raises(ResourceBusy, match="loading"):
+            await admitted(scheduler, MOE_CUDA1)
+        assert scheduler.view.problems == []
+        assert scheduler.loaded[CUDA0] is serving and serving.active == 1
+
+        first_ends.set()
+        await first
+
+    run(router, body, load_timeout=0.1)
+    assert ("load", MOE_CUDA1) not in router.calls
 
 
 def test_failed_unload_keeps_the_model_and_its_resources() -> None:

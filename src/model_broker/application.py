@@ -30,8 +30,8 @@ KEYS_FILE = "MODEL_BROKER_API_KEYS_FILE"
 JsonObject = dict[str, object]
 
 
-def seconds_setting(name: str, default: float) -> float:
-    """Read a non-negative number of seconds from the environment."""
+def seconds_setting(name: str, default: float, positive: bool = False) -> float:
+    """Read a non-negative (or, if ``positive``, a positive) number of seconds."""
     text = os.environ.get(name)
     try:
         value = float(text) if text else default
@@ -40,6 +40,8 @@ def seconds_setting(name: str, default: float) -> float:
     # "not >=" rather than "<" so that NaN is rejected too.
     if not value >= 0:
         raise ValueError(f"{name} must not be negative")
+    if positive and value == 0:
+        raise ValueError(f"{name} must be positive")
     return value
 
 
@@ -53,6 +55,8 @@ class Settings:
     idle_protect_seconds: float = 300.0
     # How long a request waits for busy conflicting models before a 503.
     max_wait_seconds: float = 30.0
+    # How long a load or unload may take before it counts as failed.
+    load_timeout_seconds: float = 600.0
     # Secrets file of "name key" lines; None turns authentication off.
     api_keys_file: Path | None = None
 
@@ -67,6 +71,9 @@ class Settings:
             preset_path=Path(preset_path),
             idle_protect_seconds=seconds_setting("MODEL_BROKER_IDLE_PROTECT_SECONDS", 300.0),
             max_wait_seconds=seconds_setting("MODEL_BROKER_MAX_WAIT_SECONDS", 30.0),
+            load_timeout_seconds=seconds_setting(
+                "MODEL_BROKER_LOAD_TIMEOUT_SECONDS", 600.0, positive=True
+            ),
             api_keys_file=Path(keys_file) if (keys_file := os.environ.get(KEYS_FILE)) else None,
         )
 
@@ -166,7 +173,7 @@ def create_app(
         async with httpx.AsyncClient(
             base_url=configured.llama_url, timeout=ROUTER_TIMEOUT_SECONDS, transport=transport
         ) as client:
-            adapter = LlamaAdapter(client)
+            adapter = LlamaAdapter(client, state_timeout_seconds=configured.load_timeout_seconds)
             view = await inspect_router(adapter, catalogue, clock())
             for problem in view.problems:
                 LOGGER.warning("broker cannot schedule: %s", problem)
@@ -181,6 +188,7 @@ def create_app(
                 max_wait_seconds=configured.max_wait_seconds,
                 clock=clock,
             )
+            await app.state.scheduler.start()
             yield
 
     app = FastAPI(

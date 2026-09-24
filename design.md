@@ -30,7 +30,7 @@ MODEL_BROKER_PRESET_PATH=/config/models-preset.ini
 
 The server-containers Compose service mounts the same unified preset into the broker at the configured path and sets `MODEL_BROKER_LLAMA_URL` to the llama service's Compose name.
 
-Other settings have safe defaults and are documented in `.env.example`: listen address and port, the API keys file (`MODEL_BROKER_API_KEYS_FILE`), load and unload timeouts, the idle protection window, the maximum request wait, and log level. Secrets are supplied through the deployment environment or a secrets mount, never committed.
+Other settings have safe defaults and are documented in `.env.example`: listen address and port, the API keys file (`MODEL_BROKER_API_KEYS_FILE`), the load and unload timeout (`MODEL_BROKER_LOAD_TIMEOUT_SECONDS`), the idle protection window, the maximum request wait, and log level. Secrets are supplied through the deployment environment or a secrets mount, never committed.
 
 ## Unified llama.cpp contract
 
@@ -38,7 +38,7 @@ The `llama-cpp` container can see both CUDA devices. The router starts with the 
 
 Each preset section is self-contained: it holds all effective settings for its model rather than relying on router-wide defaults.
 
-The router's `models-max` never needs to choose a victim. Every variant holds at least one exclusive resource (a GPU, or `RAM:weights`; see below), and no two loaded models can hold the same one. So at most as many models can be loaded at once as the catalogue has exclusive resources: three with two GPUs. If `models-max` is at least that number, it never binds, and the broker needs no process-count accounting. At startup the broker reads the router's `GET /props`, which in router mode reports `max_instances` and `models_autoload`, and refuses to schedule while `max_instances` is below the catalogue's exclusive-resource count or autoload is enabled.
+The router's `models-max` never needs to choose a victim. Every variant holds at least one exclusive resource (a GPU, or `RAM:weights`; see below), and no two loaded models can hold the same one. So the most models that can be loaded at once is the largest group of variants whose exclusive resources do not overlap: three with two GPUs (a GPU0 model, a GPU1 model, and a CPU model). If `models-max` is at least that number, it never binds, and the broker needs no process-count accounting. At startup the broker reads the router's `GET /props`, which in router mode reports `max_instances` and `models_autoload`, and refuses to schedule while `max_instances` is below that number or autoload is enabled.
 
 At deployment time, verify the relation between `CUDA0`/`CUDA1` and physical cards with `llama-server --list-devices` in the image. The broker uses llama.cpp device identifiers, not a guessed PCI bus order.
 
@@ -157,15 +157,15 @@ A loaded model's own requests keep being admitted while another model waits for 
 
 ### Observing llama.cpp
 
-The broker's own counts cover every request that passes through it. It also asks llama.cpp, because work can reach the router without the broker (for example while clients migrate), and because the router's queue is the authority on what it has accepted. The broker reads `GET /slots?model=` and `GET /metrics?model=` for a conflicting model whenever a scheduling decision depends on it, not on a timer. If the router's decode counter (`n_decode_total`, which rises during prompt processing and generation) has advanced since the previous observation, the model counts as active at the time of that observation: the broker cannot tell when the work ended, so it assumes the latest possible time.
+The broker's own counts cover every request that passes through it. It also asks llama.cpp, because work can reach the router without the broker (for example while clients migrate), and because the router's queue is the authority on what it has accepted. The broker reads `GET /slots?model=` and `GET /metrics?model=` for a conflicting model whenever a scheduling decision depends on it, not on a timer. If the router's decode counter (`n_decode_total`, which rises during prompt processing and generation) has advanced since the previous observation, the model counts as active at the time of that observation: the broker cannot tell when the work ended, so it assumes the latest possible time. The broker records the counter when it adopts or loads a model, so work before the first check is seen too; if it could not record one, the first check counts as activity.
 
 If an observation fails, the model is treated as busy. The broker never unloads a model it cannot see is idle.
 
 ## Restart and failure handling
 
-On startup the broker reads the preset, checks `GET /props`, and reads `GET /models`. Models the router reports as `loaded` or `loading` become loaded models with no active requests, and their last activity is the startup time, so the protection window applies after a broker restart. Already-loaded router workers are not needlessly discarded, although request streams do not survive a broker restart.
+On startup the broker reads the preset, checks `GET /props`, and reads `GET /models`. Every model the router reports in any state but `unloaded` becomes a loaded model with no active requests, holding its resources, and its last activity is the startup time, so the protection window applies after a broker restart. A model still `loading` is waited for before requests are admitted to it. A status the broker does not recognise is also a problem that blocks scheduling, since the broker cannot tell what it means for the model's resources. Already-loaded router workers are not needlessly discarded, although request streams do not survive a broker restart.
 
-If a load fails or never reaches `loaded`, the broker returns a backend error to the caller and does not count the variant as loaded. If an unload fails, the model still counts as loaded, holding its claims, until `GET /models` shows it gone. The broker does not ask the router to evict, and it never moves a loaded model to a different GPU or to the CPU.
+If a load fails, the broker returns a backend error to the caller. It releases the variant's resources only when the router confirms the model is `unloaded`, as after a refused request or a worker that exited. A timeout (`MODEL_BROKER_LOAD_TIMEOUT_SECONDS`) or a lost connection does not show that the worker has gone; it may still be loading onto its GPUs. The model then keeps its resources and the router is marked unfit, so that the next request checks the router again and adopts what it reports. That check keeps the broker's record of every model still loaded, with its running and waiting requests. If an unload fails, the model still counts as loaded, holding its claims, until `GET /models` shows it gone. The broker does not ask the router to evict, and it never moves a loaded model to a different GPU or to the CPU.
 
 Changing the preset is a deployment: update the file and restart the router and the broker. There is no administrative reload API.
 

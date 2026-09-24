@@ -31,6 +31,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = []
 
 [tool.ruff.format]
+# Code examples in Markdown are laid out by hand, for example with aligned comments.
+exclude = ["*.md"]
 quote-style = "double"
 indent-style = "space"
 docstring-code-format = true

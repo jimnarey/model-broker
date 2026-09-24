@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import itertools
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -228,12 +229,25 @@ def managed_resources(variants: Mapping[str, Variant]) -> frozenset[str]:
 
 
 def max_loaded_models(variants: Mapping[str, Variant]) -> int:
-    """Return the most variants that can be loaded together without conflicting.
+    """Return the largest number of variants that can be loaded together without conflict.
 
-    Every variant holds at least one exclusive resource (a GPU, or RAM:weights), and loaded
-    variants never share one, so the count of exclusive resources is an upper bound.
+    Two variants conflict when they share an exclusive resource, so this is the largest
+    group of variants whose exclusive resources do not overlap. Variants with the same
+    exclusive resources are interchangeable here, and there are few distinct sets (each is
+    drawn from the GPUs and RAM:weights), so trying every combination of them is cheap.
     """
-    return len({c.resource for item in variants.values() for c in item.claims if c.exclusive})
+    resource_sets = list(
+        {frozenset(c.resource for c in v.claims if c.exclusive) for v in variants.values()}
+    )
+    largest = 0
+    for size in range(1, len(resource_sets) + 1):
+        if not any(
+            sum(len(group) for group in combination) == len(frozenset[str]().union(*combination))
+            for combination in itertools.combinations(resource_sets, size)
+        ):
+            break  # any larger group would contain an overlapping group of this size
+        largest = size
+    return largest
 
 
 def claims_conflict(first: Variant, second: Variant) -> bool:

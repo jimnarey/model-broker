@@ -55,7 +55,9 @@ def test_router_problems(router: RouterProps, problems: list[str]) -> None:
 
 
 def test_reconcile_adopts_loaded_and_loading_models() -> None:
-    """Models the router holds or is loading become loaded models; unloaded ones are ignored.
+    """Models the router holds or is loading are adopted; unloaded ones are ignored.
+
+    A loading model is adopted but not ready, so requests for it wait for the load.
 
     Adopted models get last activity ``NOW``, so a restarted broker does not unload a model
     that someone was using a moment ago. A failed load is ``unloaded`` and so holds nothing.
@@ -71,6 +73,7 @@ def test_reconcile_adopts_loaded_and_loading_models() -> None:
 
     assert problems == []
     assert sorted(loaded) == [CUDA0, CUDA1]
+    assert loaded[CUDA0].ready.is_set() and not loaded[CUDA1].ready.is_set()
     assert all(model.last_activity == NOW for model in loaded.values())
     assert all(model.active == model.queued == 0 for model in loaded.values())
 
@@ -80,13 +83,14 @@ def test_reconcile_adopts_loaded_and_loading_models() -> None:
     [
         ({"not-in-preset--cuda0": ModelState("loaded")}, [], "but the preset lacks it"),
         ({CUDA0: ModelState("sleeping")}, [CUDA0], "sleeping; idle sleeping must be off"),
+        ({CUDA0: ModelState("unloading")}, [CUDA0], "unknown state 'unloading'"),
         (
             {CUDA1: ModelState("loaded"), MOE_CUDA1: ModelState("loaded")},
             [CUDA1, MOE_CUDA1],
             "conflicting models loaded",
         ),
     ],
-    ids=["unknown-model", "sleeping", "conflicting-models"],
+    ids=["unknown-model", "sleeping", "unknown-status", "conflicting-models"],
 )
 def test_reconcile_reports_unsafe_router_state(
     states: dict[str, ModelState], adopted: list[str], problem: str
@@ -94,7 +98,9 @@ def test_reconcile_reports_unsafe_router_state(
     """Router state the broker cannot account for is a problem that blocks scheduling.
 
     ``unknown-model`` has no claims the broker knows. ``sleeping`` is adopted, because it
-    may still hold memory, but idle sleeping should be off. ``conflicting-models`` has two
+    may still hold memory, but idle sleeping should be off. ``unknown-status`` (a status a
+    newer router might add) is adopted too: treating it as unloaded could put a second
+    model on a GPU that is still occupied. ``conflicting-models`` has two
     GPU1 models loaded, which the broker never allows, for example after router autoload.
     """
     loaded, problems = reconcile(CATALOGUE, states, NOW)

@@ -20,10 +20,18 @@ GOOD_PROPS = {"role": "router", "max_instances": 3, "models_autoload": False, "b
 
 
 def router(props: dict[str, Any] = GOOD_PROPS, loaded: tuple[str, ...] = ()) -> Handler:
-    """A mock router with the given /props and these models loaded."""
+    """A mock router with the given /props and these models loaded, all idle."""
     models = {"data": [{"id": model, "status": {"value": "loaded"}} for model in loaded]}
-    responses = {"/props": props, "/models": models}
-    return lambda request: httpx.Response(200, json=responses[request.url.path])
+    idle = (
+        "llamacpp:requests_processing 0\nllamacpp:requests_deferred 0\nllamacpp:n_decode_total 0\n"
+    )
+    responses = {
+        "/props": httpx.Response(200, json=props),
+        "/models": httpx.Response(200, json=models),
+        "/slots": httpx.Response(200, json=[{"id": 0, "is_processing": False}]),
+        "/metrics": httpx.Response(200, text=idle),
+    }
+    return lambda request: responses[request.url.path]
 
 
 def broker_request[T](
@@ -270,3 +278,12 @@ def test_settings_read_the_api_keys_file(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setenv("MODEL_BROKER_API_KEYS_FILE", "/run/secrets/broker-api-keys")
     assert Settings.from_environment().api_keys_file == Path("/run/secrets/broker-api-keys")
+
+
+def test_settings_require_a_positive_load_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A load timeout of 0 would fail every load at once, so it is refused."""
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    assert Settings.from_environment().load_timeout_seconds == 600.0
+    monkeypatch.setenv("MODEL_BROKER_LOAD_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="must be positive"):
+        Settings.from_environment()

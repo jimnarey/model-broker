@@ -12,15 +12,16 @@ import asyncio
 import itertools
 import math
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 
 from model_broker.catalogue import Variant, claims_conflict, max_loaded_models
 from model_broker.llama import LlamaAdapter, LlamaError, ModelState, RouterProps
 
-# Statuses in which a model holds, or is about to hold, its resources.
-OCCUPYING_STATES = frozenset({"loaded", "loading", "sleeping"})
+# The router statuses the broker understands. Any status but "unloaded", including one the
+# broker does not know, is taken to hold the model's resources.
+KNOWN_STATES = frozenset({"unloaded", "loading", "loaded", "sleeping"})
 # How often a waiting request re-checks models it has no end time for, such as busy ones.
 POLL_SECONDS = 1.0
 # Retry-After for a refusal with no known end time.
@@ -132,24 +133,32 @@ def router_problems(props: RouterProps, catalogue: Mapping[str, Variant]) -> lis
 def reconcile(
     catalogue: Mapping[str, Variant], states: Mapping[str, ModelState], now: float
 ) -> tuple[dict[str, LoadedModel], list[str]]:
-    """Adopt the models the router already holds, recording problems that make it unsafe.
+    """Adopt the models the router holds, recording problems that make scheduling unsafe.
 
-    Adopted models start with last activity ``now``, so the idle protection window applies
-    after a broker restart. A loaded model outside the catalogue has unknown claims, and two
-    conflicting loaded models break the broker's invariant, so both are problems.
+    Every model not ``unloaded`` is adopted, so that it keeps its resources; one still
+    ``loading`` is not ready. Adopted models start with last activity ``now``, so the idle
+    protection window applies after a broker restart. A status the broker does not know, a
+    loaded model outside the catalogue (its claims are unknown), and two conflicting loaded
+    models (which the broker never allows) are problems.
     """
     loaded: dict[str, LoadedModel] = {}
     problems: list[str] = []
     for model_id, state in states.items():
-        if state.value not in OCCUPYING_STATES:
+        if state.value == "unloaded":
             continue
+        if state.value not in KNOWN_STATES:
+            problems.append(
+                f"router reports {model_id!r} in unknown state {state.value!r}; it is taken "
+                "to hold its resources"
+            )
         if state.value == "sleeping":
             problems.append(f"router reports {model_id!r} sleeping; idle sleeping must be off")
         variant = catalogue.get(model_id)
         if variant is None:
             problems.append(f"router has {model_id!r} {state.value}, but the preset lacks it")
         else:
-            loaded[model_id] = LoadedModel(variant, last_activity=now)
+            ready = ready_event(state.value != "loading")
+            loaded[model_id] = LoadedModel(variant, last_activity=now, ready=ready)
     for first, second in itertools.combinations(loaded.values(), 2):
         if claims_conflict(first.variant, second.variant):
             problems.append(
@@ -179,6 +188,8 @@ class Scheduler:
     in a background task, so a long load does not hold up decisions about other resources.
     While they run, the models involved stay in ``loaded``, so they keep their resources and
     count as busy for any other decision.
+
+    Call ``start()`` once the event loop is running and before admitting requests.
     """
 
     def __init__(
@@ -202,11 +213,29 @@ class Scheduler:
         self.lock = asyncio.Lock()
         self.changed = asyncio.Condition()
         self.waiting: list[Ticket] = []
-        self.swaps: set[asyncio.Task[None]] = set()
+        self.tasks: set[asyncio.Task[None]] = set()
 
     @property
     def loaded(self) -> dict[str, LoadedModel]:
         return self.view.loaded
+
+    async def start(self) -> None:
+        """Begin tracking the models adopted from the router."""
+        await self.track(list(self.loaded.values()))
+
+    async def track(self, models: list[LoadedModel]) -> None:
+        """Watch newly adopted models: wait for any still loading, and record a baseline
+        decode count for the others."""
+        for model in models:
+            if model.ready.is_set():
+                await self.record_baseline(model)
+            else:
+                self.background(self.finish_load(model))
+
+    def background(self, work: Coroutine[None, None, None]) -> None:
+        task = asyncio.create_task(work)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
     @asynccontextmanager
     async def admit(self, model_id: str) -> AsyncGenerator[Variant]:
@@ -250,18 +279,46 @@ class Scheduler:
                 await self.notify()
 
     async def check_router(self) -> None:
-        """Refuse while the router is unfit, inspecting it again in case it has been fixed.
-
-        Nothing is admitted while there are problems, so replacing the adopted models from a
-        fresh inspection cannot lose track of a running request.
-        """
+        """Refuse while the router is unfit, inspecting it again in case it has been fixed."""
         if not self.view.problems:
             return
         async with self.lock:
             if self.view.problems:
-                self.view = await inspect_router(self.adapter, self.catalogue, self.clock())
+                await self.reinspect()
         if self.view.problems:
             raise RouterUnfit(self.view.problems)
+
+    async def reinspect(self) -> None:
+        """Check the router again, merging what it reports with the models already tracked.
+
+        Problems can arise while other models are serving requests, so the existing record
+        of each model the router still holds is kept, with its active and queued counts. A
+        record is replaced only if its load failed. A model the router no longer holds is
+        dropped, unless a request or an unload or load is still in progress on it. If the
+        router cannot be reached, nothing is known, so every tracked model is kept.
+        """
+        try:
+            props = await self.adapter.props()
+            states = await self.adapter.model_states()
+        except LlamaError as error:
+            self.view.problems = [f"router is unavailable: {error}"]
+            return
+        fresh, problems = reconcile(self.catalogue, states, self.clock())
+        merged: dict[str, LoadedModel] = {}
+        for model_id, adopted in fresh.items():
+            current = self.loaded.get(model_id)
+            merged[model_id] = current if current and current.error is None else adopted
+        for model_id, current in self.loaded.items():
+            in_progress = current.active or current.leaving or not current.ready.is_set()
+            if model_id not in merged and in_progress:
+                merged[model_id] = current
+        new = [
+            model for model_id, model in merged.items() if self.loaded.get(model_id) is not model
+        ]
+        self.view = RouterView(
+            merged, router_problems(props, self.catalogue) + problems, props.build
+        )
+        await self.track(new)
 
     async def join(self, model: LoadedModel) -> LoadedModel:
         """Admit a request into a model, first waiting for it if it is still loading."""
@@ -308,32 +365,85 @@ class Scheduler:
                 victim.leaving = True
             model = LoadedModel(variant, self.clock(), ready=ready_event(False))
             self.loaded[variant.id] = model
-        swap = asyncio.create_task(self.swap(conflicts, model))
-        self.swaps.add(swap)
-        swap.add_done_callback(self.swaps.discard)
+        self.background(self.swap(conflicts, model))
         return model
 
     async def swap(self, victims: list[LoadedModel], model: LoadedModel) -> None:
         """Unload the victims, then load ``model``, recording any failure on ``model``.
 
-        Each victim keeps its resources until the router confirms it has unloaded. A victim
-        that fails to unload, and any not yet unloaded, stay loaded; the requested model is
-        then not loaded. ``model`` is marked ready either way, releasing its waiters.
+        Each victim keeps its resources until the router confirms it has unloaded. If an
+        unload fails, that victim and any not yet unloaded stay loaded, and ``model`` is not
+        loaded; the router was never asked to load it, so it holds nothing. ``model`` is
+        marked ready either way, releasing its waiters.
         """
         try:
             for victim in victims:
                 await self.adapter.unload(victim.variant.id)
                 del self.loaded[victim.variant.id]
-            await self.adapter.load(model.variant.id)
         except LlamaError as error:
             for victim in victims:
                 victim.leaving = False
             del self.loaded[model.variant.id]
             model.error = str(error)
+            model.ready.set()
+            await self.notify()
+            return
+        try:
+            await self.adapter.load(model.variant.id)
+        except LlamaError as error:
+            await self.load_failed(model, error)
+        else:
+            await self.record_baseline(model)
         finally:
             model.last_activity = self.clock()
             model.ready.set()
             await self.notify()
+
+    async def finish_load(self, model: LoadedModel) -> None:
+        """Wait for an adopted model that the router is still loading."""
+        try:
+            await self.adapter.wait_for_state(model.variant.id, "loaded")
+        except LlamaError as error:
+            await self.load_failed(model, error)
+        else:
+            await self.record_baseline(model)
+        finally:
+            model.ready.set()
+            await self.notify()
+
+    async def load_failed(self, model: LoadedModel, error: LlamaError) -> None:
+        """Record a failed load, releasing the model's resources only if that is certain.
+
+        A timeout or a lost connection does not show that the worker has gone: it may still
+        be loading onto its GPUs. So the model is dropped only when the router confirms it is
+        unloaded (or not listed). Otherwise it keeps its resources, and the router is marked
+        unfit until a fresh inspection shows the model's real state.
+        """
+        model_id = model.variant.id
+        model.error = str(error)
+        try:
+            state = (await self.adapter.model_states()).get(model_id)
+        except LlamaError:
+            unloaded = False
+        else:
+            unloaded = state is None or state.value == "unloaded"
+        if unloaded:
+            if self.loaded.get(model_id) is model:
+                del self.loaded[model_id]
+        else:
+            self.view.problems.append(
+                f"loading {model_id!r} failed ({error}), and the router has not confirmed it "
+                "is unloaded, so it keeps its resources until the router is checked again"
+            )
+
+    async def record_baseline(self, model: LoadedModel) -> None:
+        """Record the model's decode count, so later work bypassing the broker shows up.
+
+        If it cannot be read, the count stays unknown and the next observation counts as
+        recent activity.
+        """
+        with suppress(LlamaError):
+            model.decode_calls = (await self.adapter.activity(model.variant.id)).decode_calls
 
     async def busy(self, conflicts: list[LoadedModel]) -> Blocked | None:
         """Return why a conflicting model cannot be unloaded yet, or None if all are idle."""
@@ -349,7 +459,8 @@ class Scheduler:
                 activity = await self.adapter.activity(name)
             except LlamaError as error:
                 return Blocked(f"cannot see whether {name!r} is idle: {error}")
-            if model.decode_calls is not None and activity.decode_calls != model.decode_calls:
+            # Without a baseline, unseen work cannot be ruled out, so assume there was some.
+            if model.decode_calls is None or activity.decode_calls != model.decode_calls:
                 model.last_activity = self.clock()
             model.decode_calls = activity.decode_calls
             if activity.processing or activity.deferred:

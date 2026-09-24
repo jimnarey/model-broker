@@ -3,6 +3,11 @@
 A broker service for managing llama requests requiring different models
 with different resource requirements.
 
+**Status:** the broker starts, validates the preset, checks the router, and
+schedules model loads, with optional API keys. The chat endpoint does not yet
+use the scheduler or proxy requests, and `/v1/models` does not exist yet; see
+[the design](design.md) for the planned API.
+
 ## Broker API
 
 `model_broker.application` is the broker's FastAPI application. It serves only
