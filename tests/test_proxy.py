@@ -101,12 +101,17 @@ def test_chat_loads_the_model_and_relays_the_reply() -> None:
     assert router.chat_payloads == [body]
 
 
-def test_a_stream_is_relayed_as_a_stream() -> None:
-    """A streamed reply keeps its SSE content type and arrives chunk for chunk."""
+def test_a_stream_is_relayed_as_a_stream(events: Callable[[], list[Event]]) -> None:
+    """A streamed reply keeps its SSE content type and arrives chunk for chunk.
+
+    A complete response is not logged as a disconnect: once the body is sent, the server
+    reports the connection as finished, which is not the client leaving early.
+    """
     response = post_chat(FakeRouter(), {"model": CUDA1, "messages": MESSAGES, "stream": True})
 
     assert response.headers["content-type"] == "text/event-stream"
     assert response.content == b"".join(STREAM_CHUNKS)
+    assert not any(isinstance(event, ClientDisconnected) for event in events())
 
 
 def test_router_errors_reach_the_client_unchanged() -> None:

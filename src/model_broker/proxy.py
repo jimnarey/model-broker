@@ -56,6 +56,9 @@ class ProxiedChat(Response):
         resources: AsyncExitStack,
     ) -> None:
         super().__init__()
+        # Set just before the last part of the body is sent. The server then reports the
+        # connection as finished, which is not the client leaving early.
+        self.finishing = False
         self.adapter = adapter
         self.payload = payload
         self.model = model
@@ -71,8 +74,9 @@ class ProxiedChat(Response):
                     nonlocal disconnected
                     while (await receive())["type"] != "http.disconnect":
                         pass
-                    disconnected = True
-                    group.cancel_scope.cancel()
+                    if not self.finishing:
+                        disconnected = True
+                        group.cancel_scope.cancel()
 
                 group.start_soon(watch_for_disconnect)
                 await self.relay(send, started)
@@ -91,6 +95,7 @@ class ProxiedChat(Response):
         except LlamaError as error:
             emit(ProxyFailed(self.model, str(error)))
             body = openai_error_body(str(error), "server_error", "router_unavailable")
+            self.finishing = True
             await send_whole(send, 502, [(b"content-type", b"application/json")], body)
             return
         headers = [
@@ -112,6 +117,7 @@ class ProxiedChat(Response):
         else:
             seconds = round(time.monotonic() - started, 3)
             emit(ProxyFinished(self.model, upstream.status_code, sent, seconds))
+        self.finishing = True
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
