@@ -5,24 +5,12 @@ with different resource requirements.
 
 ## Broker API
 
-`model_broker.application` is the first FastAPI layer of the broker. On startup
-it obtains the private router OpenAPI document from `MODEL_BROKER_LLAMA_URL`.
-It registers a safe `501 not_implemented` placeholder for each router operation
-that the broker does not own yet, so the broker OpenAPI document exposes the
-visible router surface without proxying a request around scheduling.
-
-For now, these generated entries intentionally have limited OpenAPI detail: they preserve
-the path, HTTP method, operation identifier, summary, and description, but not router
-parameters, request bodies, response schemas, security requirements, tags, or other
-metadata. They are a safe list of visible endpoints, not yet a full copy of the router
-contract. This is a temporary limitation to come back to before clients rely on the
-broker OpenAPI document for generated client code.
-
-`GET /health` is broker-owned and remains available when the router schema
-cannot be fetched. `POST /v1/chat/completions` is the first bespoke override:
-it returns a broker-specific `501` until validation, scheduling, loading, and
-proxying are implemented. It is never generated from, or passed through to,
-the router.
+`model_broker.application` is the broker's FastAPI application. It serves only
+the endpoints the broker supports; every other path, including the router's own
+management API, returns 404. `GET /health` reports broker liveness.
+`POST /v1/chat/completions` returns a broker-specific `501` until scheduling,
+loading, and proxying are implemented. See [the design](design.md) for the
+planned API.
 
 Run locally with the project environment:
 
