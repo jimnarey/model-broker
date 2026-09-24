@@ -30,7 +30,7 @@ MODEL_BROKER_PRESET_PATH=/config/models-preset.ini
 
 The server-containers Compose service mounts the same unified preset into the broker at the configured path and sets `MODEL_BROKER_LLAMA_URL` to the llama service's Compose name.
 
-Other settings have safe defaults and are documented in `.env.example`: listen address and port, the API keys file (`MODEL_BROKER_API_KEYS_FILE`), the load and unload timeout (`MODEL_BROKER_LOAD_TIMEOUT_SECONDS`), the idle protection window, the maximum request wait, and log level. Secrets are supplied through the deployment environment or a secrets mount, never committed.
+Other settings have safe defaults and are documented in `.env.example`: the idle protection window (`MODEL_BROKER_IDLE_PROTECT_SECONDS`), the maximum request wait (`MODEL_BROKER_MAX_WAIT_SECONDS`), the load and unload timeout (`MODEL_BROKER_LOAD_TIMEOUT_SECONDS`), the API keys file (`MODEL_BROKER_API_KEYS_FILE`), and the log level (`MODEL_BROKER_LOG_LEVEL`). The listen address and port are Uvicorn's command-line options. Secrets are supplied through the deployment environment or a secrets mount, never committed.
 
 ## Unified llama.cpp contract
 
@@ -120,10 +120,12 @@ The broker, rather than llama.cpp, serves the public API. It is an ASGI applicat
 
 | Endpoint | Behaviour |
 | --- | --- |
-| `GET /health` | Broker health, router reachability, and the startup `/props` check. |
+| `GET /health` | Status (`ok` or `degraded`), the number of models, the models loaded, the router's build and any problems that block scheduling, and whether authentication is on. Needs no key. |
 | `GET /v1/models` | The validated preset variants in OpenAI's `object: "list"` / `object: "model"` shape. |
 | `GET /v1/models/{model}` | One variant, or an OpenAI-style not-found error. |
-| `POST /v1/chat/completions` | Validates that `model` is a known variant, schedules it, and proxies the request and any SSE stream. |
+| `POST /v1/chat/completions` | Validates that `model` is a known variant, schedules it, and proxies the request and any SSE stream (see below). |
+
+A chat request is admitted by the scheduler before the broker responds, so a refusal gets its own OpenAI-style error: 404 `model_not_found`, 503 `resource_busy` with `Retry-After`, 503 `router_unavailable`, 502 `model_load_failed`, or 400 for a body without a model. Once admitted, the body is forwarded unchanged and the router's status, headers, and body are relayed as they arrive, so streams stay streams and router errors, such as a prompt too long for the context, reach the client unchanged. The broker watches for the client leaving throughout, including while the router is processing the prompt. If it leaves, the broker closes the router request, which stops llama.cpp generating, and releases the model at once. However a response ends, its admission is released.
 
 Every other path returns 404. Supporting another endpoint is a deliberate change: implement and test a broker handler that extracts and schedules any model it names. Endpoints with no model effect may later become plain pass-through handlers.
 
@@ -198,11 +200,17 @@ It reads only procfs, sysfs, and the NVIDIA management library, and returns stru
 
 The helper is implemented, but the broker does not consume it yet; see Deferred work.
 
+## Testing
+
+Unit tests run the real scheduler, adapter, and application against an in-memory fake router, with short real timings, and cover the scheduling rules, failures, proxying, authentication, and logging.
+
+Acceptance tests prove the broker, over HTTP, against a real llama.cpp router on the GPUs, checking the router's own view of what is loaded and working. The router image is built in this repository from a pinned llama.cpp commit (kept at the commit the deployment runs), so the tests share no build files or configuration with server-containers. The tests take the preset and the models directory from the environment, choose the smallest suitable models from the preset, and run a fresh broker process per test. They are opt-in and need both GPUs idle.
+
 ## Deferred work
 
 ### Router configuration verification
 
-Beyond the startup `GET /props` check, the broker will eventually verify the router's configuration when it attaches and periodically afterwards, before admitting new work. The profile includes at least: autoload disabled; no automatic idle sleeping, eviction, or other cleanup that can discard a loaded worker; an adequate `models-max`; no router-wide placement settings that override the preset; and the expected model-management API and catalogue. A router that cannot be verified is unhealthy for new scheduling work; the broker does not fall back to router-controlled autoload or eviction. Until then, deployment review and the pinned-router acceptance test enforce the same profile. A `sleeping` status is unexpected under this profile and marks the router unhealthy until explained.
+Beyond the startup `GET /props` check, the broker will eventually verify the router's configuration when it attaches and periodically afterwards, before admitting new work. The profile includes at least: autoload disabled; no automatic idle sleeping, eviction, or other cleanup that can discard a loaded worker; an adequate `models-max`; no router-wide placement settings that override the preset; and the expected model-management API and catalogue. A router that cannot be verified is unhealthy for new scheduling work; the broker does not fall back to router-controlled autoload or eviction. Until then, deployment review enforces the rest of the profile; the acceptance tests prove the broker against a router with this profile, but they start their own router rather than checking the deployment's. A `sleeping` status is unexpected under this profile and marks the router unhealthy until explained.
 
 ### Persistent KV-cache sessions
 

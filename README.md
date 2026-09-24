@@ -1,12 +1,15 @@
-# Model broker scaffolding
+# Model broker
 
-A broker service for managing llama requests requiring different models
-with different resource requirements.
+An OpenAI-compatible broker in front of one llama.cpp router. It decides which
+models can be loaded together on this host's GPUs and RAM, loads and unloads
+them explicitly, and proxies chat requests, so that a request for one model
+does not needlessly unload another on a different GPU. See [the design](design.md).
 
-**Status:** the broker validates the preset, checks the router, lists the
-catalogue at `/v1/models`, and schedules and proxies `POST /v1/chat/completions`
-(JSON and streamed), with optional API keys. Other OpenAI endpoints return 404;
-see [the design](design.md).
+**Status:** the broker serves `/v1/models` and scheduled, proxied
+`POST /v1/chat/completions` (JSON and streamed), with optional API keys and JSON
+logs. It is proven against a real router by the acceptance tests. It is not yet
+deployed: that happens in the server-containers repository, which also puts the
+router on a private network. Other OpenAI endpoints return 404.
 
 ## Broker API
 
@@ -14,26 +17,55 @@ see [the design](design.md).
 the endpoints the broker supports; every other path, including the router's own
 management API, returns 404.
 
-On startup the broker validates the preset at `MODEL_BROKER_PRESET_PATH`; an
-invalid preset stops startup. It then checks the router's `GET /props` and
-adopts the models the router already holds. `GET /health` reports the number of
-models, those loaded, and any reason the broker cannot schedule: for example a
-router `--models-max` below the number of models that can be loaded together,
-autoload enabled, or an unreachable router. The broker still starts in that
-case, with status `degraded`, and checks the router again on the next request.
+| Endpoint | |
+| --- | --- |
+| `GET /health` | Status, models loaded, router problems, authentication. No key needed. |
+| `GET /v1/models` | The preset's models, in OpenAI's shape. |
+| `GET /v1/models/{model}` | One model, or a 404 `model_not_found`. |
+| `POST /v1/chat/completions` | Scheduled, then proxied to the router. |
+
+### Startup
+
+The broker validates the preset at `MODEL_BROKER_PRESET_PATH`; an invalid
+preset stops startup. It then checks the router's `GET /props` and adopts the
+models the router already holds. If the router is unreachable, or would choose
+models to unload itself (a `--models-max` below the number of models that can be
+loaded together, or autoload enabled), the broker still starts, with `/health`
+status `degraded` and the reasons, refuses chat requests, and checks the router
+again on the next request.
+
+### Scheduling
 
 The scheduler (`model_broker.scheduler`) loads a requested model at once when no
-loaded model competes for its resources. Otherwise the competing models must be
-idle before it unloads them: no running or queued requests, in the broker or in
-llama.cpp, and no use within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request waits
-up to `MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy`.
-`POST /v1/chat/completions` is admitted by the scheduler, then forwarded
-unchanged, and the router's response is relayed as it arrives, streams
-included. Router errors reach the client unchanged. A refusal is an OpenAI-style
-error: 404 `model_not_found`, 503 `resource_busy` with `Retry-After`, 503
-`router_unavailable`, or 502 `model_load_failed`. When a client disconnects, the
-broker closes the router request, so llama.cpp stops generating, and releases
-the model at once.
+loaded model competes for its resources, so models on different GPUs stay
+loaded together. Otherwise the competing models must be idle before it unloads
+them: no running or queued requests, in the broker or in llama.cpp, and no use
+within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request waits up to
+`MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy` with
+`Retry-After`. A running request is never interrupted.
+
+### Chat completions
+
+An admitted request is forwarded unchanged, and the router's response is
+relayed as it arrives, streams included. Router errors reach the client
+unchanged. A refusal is an OpenAI-style error: 404 `model_not_found`, 503
+`resource_busy`, 503 `router_unavailable`, 502 `model_load_failed`, or 400 for
+a body without a model. When a client disconnects, the broker closes the router
+request, so llama.cpp stops generating, and releases the model at once.
+
+### Settings
+
+| Variable | Default | |
+| --- | --- | --- |
+| `MODEL_BROKER_LLAMA_URL` | `http://llama-cpp:8080` | The router. |
+| `MODEL_BROKER_PRESET_PATH` | required | The unified preset, the file the router uses. |
+| `MODEL_BROKER_IDLE_PROTECT_SECONDS` | `300` | How long after its last use a model cannot be unloaded. |
+| `MODEL_BROKER_MAX_WAIT_SECONDS` | `30` | How long a request waits for busy models; 0 refuses at once. |
+| `MODEL_BROKER_LOAD_TIMEOUT_SECONDS` | `600` | How long a load or unload may take. |
+| `MODEL_BROKER_API_KEYS_FILE` | unset (off) | API keys; see Authentication. |
+| `MODEL_BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+
+[`.env.example`](.env.example) describes each one.
 
 ### Logging
 
@@ -77,20 +109,16 @@ Every `/v1/` request then needs `Authorization: Bearer <key>`; a missing or
 wrong key gets OpenAI's `401 invalid_api_key`. `/health` needs no key. The file
 is read at startup, so restart the broker after changing it. Keys cross the
 network in plain HTTP until the broker is behind a TLS proxy.
-`POST /v1/chat/completions` returns a broker-specific `501` until scheduling,
-loading, and proxying are implemented. See [the design](design.md) for the
-planned API.
 
-Run locally with the project environment:
+### Running
+
+Locally, with the project environment:
 
 ```sh
 MODEL_BROKER_PRESET_PATH=/path/to/models-preset.ini \
   uv run uvicorn --app-dir src --factory model_broker.application:create_app \
   --host 127.0.0.1 --port 8000 --no-access-log
 ```
-
-The supplied [`.env.example`](.env.example) lists the current environment
-settings.
 
 ### Container
 
