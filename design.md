@@ -2,11 +2,13 @@
 
 ## Scope and decisions
 
-The broker is a standalone Python service that exposes an authenticated, OpenAI-compatible API. It sits between clients and one already-running upstream llama.cpp router. For each request it decides whether the requested model *variant* can be loaded now, which loaded model must be unloaded to make room, or whether the request must wait or be refused. It then asks the router to load and unload models and proxies the request.
+The broker is a standalone Python service that exposes an OpenAI-compatible API, with optional API-key authentication. It sits between clients and one already-running upstream llama.cpp router. For each request it decides whether the requested model *variant* can be loaded now, which loaded model must be unloaded to make room, or whether the request must wait or be refused. It then asks the router to load and unload models and proxies the request.
 
 The broker exists because the router cannot make that decision. The router's model limit is a global process count: it does not know that a GPU1 model and a GPU0 model can stay loaded together, or that a request for another GPU1 model should make only the GPU1 worker a candidate for unloading. Its request order and LRU behaviour are therefore not a scheduling policy for this host. The broker owns the set of loaded models and makes every load and unload decision explicitly.
 
 The router runs in Docker as the `llama-cpp` Compose service. Docker starts it normally and keeps it running; the broker never calls Docker, Compose, systemd, or a host-side supervisor.
+
+**Network assumption:** the router is on a private network that only the broker can reach, so every request to it passes through the broker. The deployment provides that network.
 
 The deployment in the server-containers repository supplies the unified llama.cpp preset. The broker only needs a readable path to that file; it does not need that repository, Compose files, model directories, or GPU devices. It is deliberately based on upstream llama.cpp. Experimental MoE forks remain available for benchmarking but are not on the broker path.
 
@@ -28,7 +30,7 @@ MODEL_BROKER_PRESET_PATH=/config/models-preset.ini
 
 The server-containers Compose service mounts the same unified preset into the broker at the configured path and sets `MODEL_BROKER_LLAMA_URL` to the llama service's Compose name.
 
-Other settings have safe defaults and are documented in `.env.example`: listen address and port, API key source, load and unload timeouts, the idle protection window, the maximum request wait, and log level. Secrets are supplied through the deployment environment or a secrets mount, never committed.
+Other settings have safe defaults and are documented in `.env.example`: listen address and port, the API keys file (`MODEL_BROKER_API_KEYS_FILE`), load and unload timeouts, the idle protection window, the maximum request wait, and log level. Secrets are supplied through the deployment environment or a secrets mount, never committed.
 
 ## Unified llama.cpp contract
 
@@ -139,7 +141,7 @@ A model stays loaded until a request needs its resources. There is no idle unloa
 
 ### Request flow
 
-1. Authenticate the caller and resolve `model` to a variant; an unknown model is a 404.
+1. Authenticate the caller, when API keys are configured, and resolve `model` to a variant; an unknown model is a 404.
 2. If the variant is loaded, proxy immediately. If slots are busy, llama.cpp queues the request itself. If the variant is loading, wait for that load.
 3. Otherwise, find the loaded models whose claims conflict with the variant. The request proceeds only when every one of them is *displaceable*. A loaded model is **busy** while any of these holds:
    - **it is working**: the broker has active requests for it, or llama.cpp reports a processing slot or `requests_processing > 0`;
@@ -169,7 +171,15 @@ Changing the preset is a deployment: update the file and restart the router and 
 
 ## Networking, authentication, and logging
 
-The broker is the only externally reachable API service. It authenticates clients with broker API keys. The broker and router share only their internal Compose network; the broker receives the router URL and a read-only preset mount, plus normal configuration and secrets.
+The broker is the only externally reachable API service. The router is on a private network shared only with the broker, so the broker is the only way to reach it. The broker receives the router URL and a read-only preset mount, plus normal configuration and secrets. Network layout belongs to the deployment, not this repository.
+
+Authentication is optional, so that existing clients keep working while they are given keys:
+
+- With no keys file configured, authentication is off. The broker accepts every request and ignores any key a client sends (many OpenAI clients always send one). Startup logs a warning and `/health` reports that authentication is off.
+- `MODEL_BROKER_API_KEYS_FILE` names a secrets file with one `name key` pair per line: one key per client. When it is set, every `/v1/` request needs `Authorization: Bearer <key>`, compared in constant time; anything else gets an OpenAI-style 401. `/health` stays unauthenticated for health checks.
+- Logs record the client's name, never its key, so one client can be identified or revoked without affecting the others.
+
+A bearer key crossing the LAN in plain HTTP can be read by anyone on the network. The deployment will later put the broker behind the Caddy gateway, which terminates TLS; that needs no change to the broker.
 
 The broker emits structured JSON logs for preset validation, the startup check, load and unload transitions, scheduling decisions (admit, wait, refuse, and why), timeouts, request lifecycle summaries, and reconciliation. It never logs API keys, Authorization headers, prompts, completions, or streamed output.
 
