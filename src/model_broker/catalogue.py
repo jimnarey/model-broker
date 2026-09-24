@@ -175,6 +175,8 @@ def preset_header(lines: list[str]) -> dict[str, str]:
         key, separator, value = text.partition("=")
         if not separator:
             raise CatalogueError(f"invalid preset line {number}: {text!r}")
+        if key.strip() in header:
+            raise CatalogueError(f"preset line {number} repeats top-level setting {key.strip()!r}")
         header[key.strip()] = value.strip()
     return header
 

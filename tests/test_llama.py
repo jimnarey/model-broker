@@ -114,6 +114,18 @@ def test_model_states_reads_value_and_failure_from_the_real_shape() -> None:
             httpx.Response(200, json={"data": [model_entry("a", LOADED)] * 2}),
             "repeats model 'a'",
         ),
+        (
+            httpx.Response(200, json={"data": [model_entry("a", FAILED | {"failed": "true"})]}),
+            "invalid failure status for 'a'",
+        ),
+        (
+            httpx.Response(200, json={"data": [model_entry("a", FAILED | {"exit_code": "1"})]}),
+            "invalid failure status for 'a'",
+        ),
+        (
+            httpx.Response(200, json={"data": [model_entry("a", FAILED | {"exit_code": True})]}),
+            "invalid failure status for 'a'",
+        ),
     ],
     ids=[
         "http-error",
@@ -123,15 +135,37 @@ def test_model_states_reads_value_and_failure_from_the_real_shape() -> None:
         "entry-not-object",
         "no-status-value",
         "duplicate-id",
+        "failed-as-string",
+        "exit-code-as-string",
+        "exit-code-as-boolean",
     ],
 )
 def test_model_states_rejects_unusable_responses(response: httpx.Response, error: str) -> None:
     """A broken /models response is an error, never an empty or partial list of models.
 
-    Reading it as "nothing loaded" would let the scheduler load over a running worker.
+    Reading it as "nothing loaded" would let the scheduler load over a running worker. The
+    last three cases are failure fields of the wrong type: silently reading ``"true"`` as not
+    failed would hide a crashed worker, and JSON ``true`` must not pass as exit code 1
+    although ``isinstance(True, int)`` holds in Python.
     """
     with pytest.raises(LlamaError, match=error):
         run(lambda _: response, LlamaAdapter.model_states)
+
+
+def test_model_states_accepts_a_failure_without_exit_code() -> None:
+    """``exit_code`` is optional: a failure without one is still a failure, with code None.
+
+    The field is undocumented, and a worker killed by a signal may not report one, so its
+    absence must not make the whole /models response unusable.
+    """
+    failed = {"value": "unloaded", "failed": True}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [model_entry("a", failed)]})
+
+    assert run(handler, LlamaAdapter.model_states) == {
+        "a": ModelState("unloaded", failed=True, exit_code=None)
+    }
 
 
 # Load and unload

@@ -170,6 +170,10 @@ def test_section_settings_override_star_defaults() -> None:
         ("version = 2\n[m--cpu]\n", "must start with version = 1"),
         ("version = 1\nthreads = 8\n[m--cpu]\n", "no other top-level settings"),
         ("version = 1\nnot a setting\n[m--cpu]\n", "invalid preset line 2"),
+        (
+            "version = 2\n; note\nversion = 1\n[m--cpu]\n",
+            "line 3 repeats top-level setting 'version'",
+        ),
         ("version = 1\n[DEFAULT]\nmodel = /m.gguf\n", r"\[DEFAULT\] is not supported"),
         ("version = 1\n[*]\nthreads = 8\n", "no model sections"),
         ("version = 1\n[a--cpu]\n[a--cpu]\n", r"\[line +3\]"),
@@ -179,6 +183,7 @@ def test_section_settings_override_star_defaults() -> None:
         "wrong-version",
         "other-top-level-key",
         "malformed-header",
+        "repeated-version",
         "configparser-default",
         "no-models",
         "duplicate-section",
@@ -189,6 +194,8 @@ def test_malformed_preset_structure_is_rejected(text: str, error: str) -> None:
 
     ``[DEFAULT]`` is Python-only inheritance that llama.cpp would not apply, and top-level
     keys other than version would be settings the broker cannot attribute to a variant.
+    ``repeated-version`` lists version 2 then version 1: accepting the later value would hide
+    the contradiction, and the error names line 3 because comments count as lines.
     ``duplicate-section`` checks that error line numbers still match the file although the
     header is parsed separately.
     """

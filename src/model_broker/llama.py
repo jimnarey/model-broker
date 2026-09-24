@@ -44,16 +44,18 @@ def parse_model_states(document: object) -> dict[str, ModelState]:
         entry = cast(JsonObject, item) if isinstance(item, dict) else {}
         status = entry.get("status")
         status = cast(JsonObject, status) if isinstance(status, dict) else {}
-        model_id, value, exit_code = entry.get("id"), status.get("value"), status.get("exit_code")
+        model_id, value = entry.get("id"), status.get("value")
         if not isinstance(model_id, str) or not isinstance(value, str):
             raise LlamaError("router GET /models response has an invalid model entry")
         if model_id in states:
             raise LlamaError(f"router GET /models response repeats model {model_id!r}")
-        states[model_id] = ModelState(
-            value=value,
-            failed=status.get("failed") is True,
-            exit_code=exit_code if isinstance(exit_code, int) else None,
-        )
+        failed, exit_code = status.get("failed", False), status.get("exit_code")
+        # type() rather than isinstance(), because JSON true is also a Python int.
+        if type(failed) is not bool or (exit_code is not None and type(exit_code) is not int):
+            raise LlamaError(
+                f"router GET /models response has an invalid failure status for {model_id!r}"
+            )
+        states[model_id] = ModelState(value=value, failed=failed, exit_code=exit_code)
     return states
 
 
