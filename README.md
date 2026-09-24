@@ -7,7 +7,15 @@ with different resource requirements.
 
 `model_broker.application` is the broker's FastAPI application. It serves only
 the endpoints the broker supports; every other path, including the router's own
-management API, returns 404. `GET /health` reports broker liveness.
+management API, returns 404.
+
+On startup the broker validates the preset at `MODEL_BROKER_PRESET_PATH`; an
+invalid preset stops startup. It then checks the router's `GET /props` and
+adopts the models the router already holds. `GET /health` reports the number of
+models, those loaded, and any reason the broker cannot schedule: for example a
+router `--models-max` below the number of models that can be loaded together,
+autoload enabled, or an unreachable router. The broker still starts in that
+case, with status `degraded`.
 `POST /v1/chat/completions` returns a broker-specific `501` until scheduling,
 loading, and proxying are implemented. See [the design](design.md) for the
 planned API.
@@ -15,7 +23,9 @@ planned API.
 Run locally with the project environment:
 
 ```sh
-uv run uvicorn --app-dir src --factory model_broker.application:create_app --host 127.0.0.1 --port 8000
+MODEL_BROKER_PRESET_PATH=/path/to/models-preset.ini \
+  uv run uvicorn --app-dir src --factory model_broker.application:create_app \
+  --host 127.0.0.1 --port 8000
 ```
 
 The supplied [`.env.example`](.env.example) lists the current environment
@@ -32,6 +42,8 @@ socket.
 docker build --tag model-broker-dev:local .
 docker run --rm --publish 8000:8000 \
   --env MODEL_BROKER_LLAMA_URL=http://llama-cpp:8080 \
+  --env MODEL_BROKER_PRESET_PATH=/config/models-preset.ini \
+  --volume /path/to/models-preset.ini:/config/models-preset.ini:ro \
   model-broker-dev:local
 ```
 

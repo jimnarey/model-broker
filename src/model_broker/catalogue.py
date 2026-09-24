@@ -227,6 +227,15 @@ def managed_resources(variants: Mapping[str, Variant]) -> frozenset[str]:
     return frozenset(claim.resource for item in variants.values() for claim in item.claims)
 
 
+def max_loaded_models(variants: Mapping[str, Variant]) -> int:
+    """Return the most variants that can be loaded together without conflicting.
+
+    Every variant holds at least one exclusive resource (a GPU, or RAM:weights), and loaded
+    variants never share one, so the count of exclusive resources is an upper bound.
+    """
+    return len({c.resource for item in variants.values() for c in item.claims if c.exclusive})
+
+
 def claims_conflict(first: Variant, second: Variant) -> bool:
     """Return whether both variants claim some resource exclusively."""
     exclusive = {claim.resource for claim in first.claims if claim.exclusive}

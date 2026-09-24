@@ -11,6 +11,7 @@ from model_broker.catalogue import (
     claims_conflict,
     load_catalogue,
     managed_resources,
+    max_loaded_models,
     parse_catalogue,
 )
 
@@ -85,6 +86,31 @@ def test_real_sections_are_classified_and_claim_their_gpus(
 def test_managed_resources_come_from_the_preset(real: dict[str, Variant]) -> None:
     """The resource set is derived from the preset: CPU, RAM:weights, and each GPU used."""
     assert managed_resources(real) == {"CPU", "RAM:weights", "GPU0", "GPU1"}
+
+
+@pytest.mark.parametrize(
+    ("variant_ids", "limit"),
+    [
+        ([CUDA0, CUDA1, MOE_CUDA1, DUAL, CPU], 3),
+        ([CUDA0, CUDA1], 2),
+        ([CUDA0, CPU], 2),
+        ([CUDA0, DUAL], 2),
+    ],
+    ids=["whole-fixture", "one-model-per-gpu", "gpu-and-cpu", "dual-gpu"],
+)
+def test_max_loaded_models_counts_exclusive_resources(
+    real: dict[str, Variant], variant_ids: list[str], limit: int
+) -> None:
+    """The most models that can be loaded together is the number of exclusive resources.
+
+    Each loaded model holds at least one exclusive resource that no other loaded model can
+    hold. ``whole-fixture`` has GPU0, GPU1 and RAM:weights, so 3: for example CUDA0, CUDA1
+    and CPU together. ``dual-gpu`` gives 2 although at most one of its models can be loaded
+    at a time: the bound counts resources, not the models available to fill them, and a
+    router limit above the true maximum does no harm.
+    """
+    catalogue = {variant_id: real[variant_id] for variant_id in variant_ids}
+    assert max_loaded_models(catalogue) == limit
 
 
 # Claims and conflicts

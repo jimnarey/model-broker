@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from model_broker.llama import LlamaAdapter, LlamaError, ModelState
+from model_broker.llama import LlamaAdapter, LlamaError, ModelActivity, ModelState, RouterProps
 
 MODEL = "qwen2.5-coder-7b-instruct-q4_k_m--cuda0"
 LOADING = {"value": "loading"}
@@ -262,6 +262,140 @@ def test_wait_for_a_model_the_router_does_not_list() -> None:
 
     with pytest.raises(LlamaError, match="does not list model 'other--cuda1'"):
         run(handler, lambda llama: llama.wait_for_state("other--cuda1", "loaded"))
+
+
+# Router settings and model activity
+
+# Captured from the pinned router (build b10920-eafe15a5e), trimmed.
+ROUTER_PROPS = {
+    "role": "router",
+    "max_instances": 3,
+    "models_autoload": False,
+    "model_alias": "llama-server",
+    "model_path": "none",
+    "build_info": "b10920-eafe15a5e",
+}
+IDLE_SLOTS = [{"id": 0, "n_ctx": 32768, "speculative": False, "is_processing": False}]
+BUSY_SLOTS = [
+    {"id": 0, "n_ctx": 32768, "is_processing": True, "id_task": 3, "n_prompt_tokens": 215}
+]
+
+
+def metrics_page(processing: int = 0, deferred: int = 0, decode_calls: int = 0) -> str:
+    """A /metrics page in the router's format, with the samples the broker reads."""
+    return (
+        "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed\n"
+        "# TYPE llamacpp:prompt_tokens_total counter\n"
+        "llamacpp:prompt_tokens_total 0\n"
+        f"llamacpp:n_decode_total {decode_calls}\n"
+        "llamacpp:predicted_tokens_seconds 0\n"
+        "# TYPE llamacpp:requests_processing gauge\n"
+        f"llamacpp:requests_processing {processing}\n"
+        f"llamacpp:requests_deferred {deferred}\n"
+    )
+
+
+def serve(routes: dict[str, httpx.Response]) -> tuple[Handler, list[httpx.Request]]:
+    """A mock router answering each path from ``routes``; returns it and the requests seen."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return routes[request.url.path]
+
+    return handler, seen
+
+
+def test_props_reads_the_router_settings() -> None:
+    handler, _ = serve({"/props": httpx.Response(200, json=ROUTER_PROPS)})
+
+    assert run(handler, LlamaAdapter.props) == RouterProps(3, False, "b10920-eafe15a5e")
+
+
+@pytest.mark.parametrize(
+    ("props", "error"),
+    [
+        (ROUTER_PROPS | {"role": "model"}, "role is not 'router'"),
+        (ROUTER_PROPS | {"max_instances": True}, "invalid max_instances"),
+        (ROUTER_PROPS | {"models_autoload": "false"}, "invalid max_instances or autoload"),
+        ({"role": "router"}, "invalid max_instances"),
+    ],
+    ids=["model-server", "boolean-max-instances", "string-autoload", "missing-settings"],
+)
+def test_props_rejects_unusable_responses(props: dict[str, Any], error: str) -> None:
+    """The broker must know it is talking to a router, and read both settings exactly.
+
+    A single model server also answers /props, but with role "model"; it cannot load or
+    unload models, so it is refused rather than misread.
+    """
+    handler, _ = serve({"/props": httpx.Response(200, json=props)})
+
+    with pytest.raises(LlamaError, match=error):
+        run(handler, LlamaAdapter.props)
+
+
+@pytest.mark.parametrize(
+    ("slots", "metrics", "expected"),
+    [
+        (IDLE_SLOTS, metrics_page(decode_calls=152), ModelActivity(False, 0, 152)),
+        (BUSY_SLOTS, metrics_page(processing=1, decode_calls=43), ModelActivity(True, 0, 43)),
+        (IDLE_SLOTS, metrics_page(processing=1), ModelActivity(True, 0, 0)),
+        (BUSY_SLOTS, metrics_page(processing=1, deferred=2), ModelActivity(True, 2, 0)),
+    ],
+    ids=["idle", "slot-processing", "request-processing", "requests-queued"],
+)
+def test_activity_combines_slots_and_metrics(
+    slots: list[dict[str, Any]], metrics: str, expected: ModelActivity
+) -> None:
+    """A model is processing if any slot is, or the metrics count a running request.
+
+    Both are read because either can show work the other has not yet reflected. Queued
+    requests come from ``requests_deferred`` and the decode count from ``n_decode_total``.
+    The values in ``idle`` and ``slot-processing`` were seen on the pinned router after and
+    during one generation.
+    """
+    handler, seen = serve(
+        {"/slots": httpx.Response(200, json=slots), "/metrics": httpx.Response(200, text=metrics)}
+    )
+
+    assert run(handler, lambda llama: llama.activity(MODEL)) == expected
+    assert [(request.url.path, request.url.params["model"]) for request in seen] == [
+        ("/slots", MODEL),
+        ("/metrics", MODEL),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("slots", "metrics", "error"),
+    [
+        (httpx.Response(200, json=[]), metrics_page(), "not a list of slots"),
+        (httpx.Response(200, json=[{"is_processing": "yes"}]), metrics_page(), "is_processing"),
+        (
+            httpx.Response(200, json=IDLE_SLOTS),
+            "llamacpp:requests_processing 0\n",
+            "lack n_decode_total, requests_deferred; is --metrics set",
+        ),
+        (httpx.Response(200, json=IDLE_SLOTS), "llamacpp:n_decode_total many\n", "not a sample"),
+        (
+            httpx.Response(400, json={"error": {"message": "model is not loaded"}}),
+            metrics_page(),
+            "GET /slots failed",
+        ),
+    ],
+    ids=["no-slots", "invalid-flag", "missing-metrics", "malformed-metric", "model-not-loaded"],
+)
+def test_activity_rejects_unusable_responses(
+    slots: httpx.Response, metrics: str, error: str
+) -> None:
+    """Activity that cannot be read is an error, never "idle".
+
+    The scheduler treats an error as busy, so an unreadable model is never unloaded. The
+    router answers 400 "model is not loaded" for a model that is not loaded.
+    """
+    handler, _ = serve({"/slots": slots, "/metrics": httpx.Response(200, text=metrics)})
+
+    with pytest.raises(LlamaError, match=error):
+        run(handler, lambda llama: llama.activity(MODEL))
 
 
 # Chat completions

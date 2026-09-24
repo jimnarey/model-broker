@@ -60,6 +60,76 @@ def parse_model_states(document: object) -> dict[str, ModelState]:
 
 
 @dataclass(frozen=True, slots=True)
+class RouterProps:
+    """The router settings the broker depends on, from ``GET /props``."""
+
+    max_instances: int
+    models_autoload: bool
+    build: str | None
+
+
+def parse_router_props(document: object) -> RouterProps:
+    props = cast(JsonObject, document) if isinstance(document, dict) else {}
+    max_instances, autoload, build = (
+        props.get("max_instances"),
+        props.get("models_autoload"),
+        props.get("build_info"),
+    )
+    if props.get("role") != "router":
+        raise LlamaError("GET /props did not come from a llama.cpp router (role is not 'router')")
+    # type() rather than isinstance(), because JSON true is also a Python int.
+    if type(max_instances) is not int or type(autoload) is not bool:
+        raise LlamaError("router GET /props response has invalid max_instances or autoload")
+    return RouterProps(max_instances, autoload, build if isinstance(build, str) else None)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelActivity:
+    """What a loaded model's server reports it is doing.
+
+    ``decode_calls`` counts llama_decode() calls. It rises while the model processes a prompt
+    or generates, whereas the token counters only change when a request finishes, so a
+    change between two observations shows the model worked in between.
+    """
+
+    processing: bool
+    deferred: int
+    decode_calls: int
+
+
+def parse_prometheus(text: str) -> dict[str, float]:
+    """Parse unlabelled ``llamacpp:<name> <value>`` samples from a metrics page."""
+    samples: dict[str, float] = {}
+    for line in text.splitlines():
+        name, _, value = line.strip().rpartition(" ")
+        if name and not line.startswith("#"):
+            try:
+                samples[name.removeprefix("llamacpp:")] = float(value)
+            except ValueError as error:
+                raise LlamaError(f"router metrics line is not a sample: {line!r}") from error
+    return samples
+
+
+def parse_model_activity(slots: object, metrics: str) -> ModelActivity:
+    """Combine a model's ``/slots`` document and ``/metrics`` page into its activity."""
+    entries = cast(list[object], slots) if isinstance(slots, list) else None
+    if not entries or any(not isinstance(slot, dict) for slot in entries):
+        raise LlamaError("router GET /slots response is not a list of slots")
+    processing = [cast(JsonObject, slot).get("is_processing") for slot in entries]
+    if any(type(flag) is not bool for flag in processing):
+        raise LlamaError("router GET /slots response has an invalid is_processing value")
+    samples = parse_prometheus(metrics)
+    missing = {"requests_processing", "requests_deferred", "n_decode_total"} - samples.keys()
+    if missing:
+        raise LlamaError(f"router metrics lack {', '.join(sorted(missing))}; is --metrics set?")
+    return ModelActivity(
+        processing=any(processing) or samples["requests_processing"] > 0,
+        deferred=int(samples["requests_deferred"]),
+        decode_calls=int(samples["n_decode_total"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class LlamaAdapter:
     """Use the documented router API without knowing how the router was deployed.
 
@@ -80,14 +150,33 @@ class LlamaAdapter:
         if not self.poll_interval_seconds >= 0:
             raise ValueError("poll_interval_seconds must not be negative")
 
-    async def model_states(self) -> dict[str, ModelState]:
+    async def get(self, path: str, **params: str) -> httpx.Response:
+        """GET a router path, turning transport failures and error statuses into LlamaError."""
         try:
-            response = await self.client.get("/models")
+            response = await self.client.get(path, params=params)
             response.raise_for_status()
-            document: object = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            raise LlamaError(f"router GET /models failed: {error}") from error
-        return parse_model_states(document)
+        except httpx.HTTPError as error:
+            raise LlamaError(f"router GET {path} failed: {error}") from error
+        return response
+
+    async def get_json(self, path: str, **params: str) -> object:
+        response = await self.get(path, **params)
+        try:
+            return cast(object, response.json())
+        except ValueError as error:
+            raise LlamaError(f"router GET {path} failed: response is not JSON") from error
+
+    async def props(self) -> RouterProps:
+        return parse_router_props(await self.get_json("/props"))
+
+    async def activity(self, model_id: str) -> ModelActivity:
+        """Read a loaded model's slots and metrics. The router needs ``--metrics``."""
+        slots = await self.get_json("/slots", model=model_id)
+        metrics = await self.get("/metrics", model=model_id)
+        return parse_model_activity(slots, metrics.text)
+
+    async def model_states(self) -> dict[str, ModelState]:
+        return parse_model_states(await self.get_json("/models"))
 
     async def model_state(self, model_id: str) -> ModelState:
         state = (await self.model_states()).get(model_id)
