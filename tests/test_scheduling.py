@@ -18,6 +18,19 @@ import httpx
 import pytest
 
 from model_broker.catalogue import load_catalogue
+from model_broker.events import (
+    Event,
+    ModelLoaded,
+    ModelLoadFailed,
+    ModelObserved,
+    ModelUnloaded,
+    RequestAdmitted,
+    RequestFinished,
+    RequestRefused,
+    RequestWaiting,
+    RouterProblemsFound,
+    SwapStarted,
+)
 from model_broker.llama import LlamaAdapter
 from model_broker.scheduler import (
     BUSY_RETRY_AFTER_SECONDS,
@@ -25,6 +38,7 @@ from model_broker.scheduler import (
     ResourceBusy,
     RouterUnfit,
     Scheduler,
+    SchedulerError,
     UnknownModel,
     inspect_router,
 )
@@ -101,7 +115,7 @@ class FakeRouter:
 
 def run(
     router: FakeRouter,
-    body: Callable[[Scheduler], Awaitable[None]],
+    body: Callable[[Scheduler], Awaitable[object]],
     protect: float = 0.0,
     max_wait: float = 0.0,
     load_timeout: float = 60.0,
@@ -630,3 +644,115 @@ def test_unknown_model_is_refused() -> None:
             await admitted(scheduler, "no-such-model--cuda0")
 
     run(FakeRouter(), body)
+
+
+# Events
+
+
+def test_a_swap_is_logged_step_by_step(events: Callable[[], list[Event]]) -> None:
+    """Replacing a model logs the decision, the unload, the load, then the request.
+
+    Setup: idle CUDA1 is loaded; a request asks for MOE_CUDA1. Expect, in order: the swap
+    naming what it unloads, CUDA1 unloaded, MOE_CUDA1 loaded, the request admitted, and
+    the request finished.
+    """
+    run(FakeRouter(loaded=(CUDA1,)), lambda scheduler: admitted(scheduler, MOE_CUDA1))
+
+    steps = [
+        (type(event), getattr(event, "model", None))
+        for event in events()
+        if isinstance(
+            event, SwapStarted | ModelUnloaded | ModelLoaded | RequestAdmitted | RequestFinished
+        )
+    ]
+    assert steps == [
+        (SwapStarted, MOE_CUDA1),
+        (ModelUnloaded, CUDA1),
+        (ModelLoaded, MOE_CUDA1),
+        (RequestAdmitted, MOE_CUDA1),
+        (RequestFinished, MOE_CUDA1),
+    ]
+    assert SwapStarted(MOE_CUDA1, [CUDA1]) in events()
+
+
+@pytest.mark.parametrize(
+    ("model", "cause"),
+    [(MOE_CUDA1, "resource_busy"), ("no-such-model--cuda0", "unknown_model")],
+    ids=["busy", "unknown"],
+)
+def test_a_refusal_is_logged_with_its_cause(
+    events: Callable[[], list[Event]], model: str, cause: str
+) -> None:
+    """The cause is the refusal's kind; the detail is the scheduler's reason."""
+
+    async def body(scheduler: Scheduler) -> None:
+        with pytest.raises(SchedulerError):
+            await admitted(scheduler, model)
+
+    run(FakeRouter(loaded=(CUDA1,)), body, protect=60)
+    refusals = [event for event in events() if isinstance(event, RequestRefused)]
+    assert [(r.model, r.cause) for r in refusals] == [(model, cause)]
+
+
+def test_waiting_is_logged_once_per_reason(events: Callable[[], list[Event]]) -> None:
+    """A waiting request re-checks every poll, but logs its reason only when it changes.
+
+    Setup: CUDA1 serves a request throughout; a request for MOE_CUDA1 waits 0.2 s, polling
+    every 0.01 s, then is refused. Expect one RequestWaiting, not one per poll.
+    """
+    router = FakeRouter(loaded=(CUDA1,))
+
+    async def body(scheduler: Scheduler) -> None:
+        stream_ends = asyncio.Event()
+        stream = asyncio.create_task(hold(scheduler, CUDA1, stream_ends))
+        await asyncio.sleep(0.02)
+        with pytest.raises(ResourceBusy):
+            await admitted(scheduler, MOE_CUDA1)
+        stream_ends.set()
+        await stream
+
+    run(router, body, max_wait=0.2)
+    waiting = [event for event in events() if isinstance(event, RequestWaiting)]
+    assert waiting == [
+        RequestWaiting(MOE_CUDA1, f"{CUDA1!r} is loading, working, or has requests waiting")
+    ]
+
+
+def test_observations_are_logged(events: Callable[[], list[Event]]) -> None:
+    """What llama.cpp reported about a model the scheduler considered unloading is logged,
+    including whether it counted as recent activity."""
+    router = FakeRouter(loaded=(CUDA1,))
+    router.deferred[CUDA1] = 2
+
+    async def body(scheduler: Scheduler) -> None:
+        with pytest.raises(ResourceBusy):
+            await admitted(scheduler, MOE_CUDA1)
+
+    run(router, body)
+    assert ModelObserved(CUDA1, False, 2, 0, False) in events()
+
+
+@pytest.mark.parametrize(
+    ("hold_load", "released"),
+    [(False, True), (True, False)],
+    ids=["refused-load", "timed-out-load"],
+)
+def test_a_failed_load_is_logged_with_whether_it_was_released(
+    events: Callable[[], list[Event]], hold_load: bool, released: bool
+) -> None:
+    """A refused load is known to hold nothing; a timed-out one may still be loading, so it
+    is not released, and the router problem that follows is logged too."""
+    router = FakeRouter()
+    if hold_load:
+        router.loads_finish.clear()
+    else:
+        router.fail.add(("load", CUDA1))
+
+    async def body(scheduler: Scheduler) -> None:
+        with pytest.raises(LoadFailed):
+            await admitted(scheduler, CUDA1)
+
+    run(router, body, load_timeout=0.1)
+    failures = [event for event in events() if isinstance(event, ModelLoadFailed)]
+    assert [(f.model, f.released) for f in failures] == [(CUDA1, released)]
+    assert any(isinstance(event, RouterProblemsFound) for event in events()) is not released

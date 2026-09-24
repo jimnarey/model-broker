@@ -5,7 +5,6 @@ Run with ``uvicorn --factory model_broker.application:create_app``.
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 from collections.abc import AsyncGenerator, Callable
@@ -20,10 +19,20 @@ from fastapi.responses import JSONResponse
 
 from model_broker.auth import ApiKeys, client_for, load_api_keys
 from model_broker.catalogue import load_catalogue
+from model_broker.events import (
+    LEVELS,
+    REQUEST,
+    AuthenticationOff,
+    AuthenticationOn,
+    BrokerStarted,
+    RouterProblemsFound,
+    configure_logging,
+    emit,
+)
+from model_broker.instrumentation import ROUTER_EVENT_HOOKS, RequestEvents
 from model_broker.llama import LlamaAdapter
 from model_broker.scheduler import Scheduler, inspect_router
 
-LOGGER = logging.getLogger(__name__)
 # Bounds each router control and observation request; inference has its own timeout.
 ROUTER_TIMEOUT_SECONDS = 10.0
 KEYS_FILE = "MODEL_BROKER_API_KEYS_FILE"
@@ -59,6 +68,8 @@ class Settings:
     load_timeout_seconds: float = 600.0
     # Secrets file of "name key" lines; None turns authentication off.
     api_keys_file: Path | None = None
+    # DEBUG adds every admission, wait, observation, router call and broker request.
+    log_level: str = "INFO"
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -75,7 +86,15 @@ class Settings:
                 "MODEL_BROKER_LOAD_TIMEOUT_SECONDS", 600.0, positive=True
             ),
             api_keys_file=Path(keys_file) if (keys_file := os.environ.get(KEYS_FILE)) else None,
+            log_level=log_level_setting(),
         )
+
+
+def log_level_setting() -> str:
+    level = os.environ.get("MODEL_BROKER_LOG_LEVEL", "INFO").upper()
+    if level not in LEVELS:
+        raise ValueError(f"MODEL_BROKER_LOG_LEVEL must be one of {', '.join(LEVELS)}")
+    return level
 
 
 def not_implemented(message: str, code: str) -> JSONResponse:
@@ -101,18 +120,21 @@ def unauthenticated(_: Request, __: Exception) -> JSONResponse:
 
 
 async def authenticate(request: Request) -> None:
-    """Record the calling client's name, requiring a valid key when keys are configured.
+    """Require a valid key when keys are configured, and record the client's name.
 
-    With authentication off every request is accepted, whatever key it sends, and the
-    client is recorded as None.
+    With authentication off every request is accepted, whatever key it sends, and no client
+    is recorded. The name goes on the request context, so every event the request causes
+    carries it.
     """
     keys = cast(ApiKeys | None, request.app.state.api_keys)
-    client = None
-    if keys is not None:
-        client = client_for(keys, request.headers.get("authorization"))
-        if client is None:
-            raise Unauthenticated
-    request.state.client = client
+    if keys is None:
+        return
+    client = client_for(keys, request.headers.get("authorization"))
+    if client is None:
+        raise Unauthenticated
+    context = REQUEST.get()
+    if context is not None:
+        context.client = client
 
 
 router = APIRouter(tags=["broker"])
@@ -160,26 +182,27 @@ def create_app(
     router does not stop startup; it is reported by /health and blocks scheduling.
     """
     configured = settings or Settings.from_environment()
+    configure_logging(configured.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         catalogue = load_catalogue(configured.preset_path)
         if configured.api_keys_file is None:
             app.state.api_keys = None
-            LOGGER.warning("authentication is off: set %s to require API keys", KEYS_FILE)
+            emit(AuthenticationOff())
         else:
             app.state.api_keys = load_api_keys(configured.api_keys_file)
-            LOGGER.info("authentication is on for %s clients", len(app.state.api_keys))
+            emit(AuthenticationOn(len(app.state.api_keys)))
         async with httpx.AsyncClient(
-            base_url=configured.llama_url, timeout=ROUTER_TIMEOUT_SECONDS, transport=transport
+            base_url=configured.llama_url,
+            timeout=ROUTER_TIMEOUT_SECONDS,
+            transport=transport,
+            event_hooks=ROUTER_EVENT_HOOKS,
         ) as client:
             adapter = LlamaAdapter(client, state_timeout_seconds=configured.load_timeout_seconds)
             view = await inspect_router(adapter, catalogue, clock())
-            for problem in view.problems:
-                LOGGER.warning("broker cannot schedule: %s", problem)
-            LOGGER.info(
-                "catalogue has %s models; router holds %s", len(catalogue), sorted(view.loaded)
-            )
+            if view.problems:
+                emit(RouterProblemsFound(view.problems))
             app.state.scheduler = Scheduler(
                 adapter,
                 catalogue,
@@ -189,6 +212,7 @@ def create_app(
                 clock=clock,
             )
             await app.state.scheduler.start()
+            emit(BrokerStarted(len(catalogue), sorted(view.loaded), view.build))
             yield
 
     app = FastAPI(
@@ -198,6 +222,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.add_exception_handler(Unauthenticated, unauthenticated)
+    app.add_middleware(RequestEvents)
     app.include_router(router)
     app.include_router(api)
     return app

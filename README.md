@@ -29,6 +29,29 @@ llama.cpp, and no use within `MODEL_BROKER_IDLE_PROTECT_SECONDS`. A request wait
 up to `MODEL_BROKER_MAX_WAIT_SECONDS` for that, then gets `503 resource_busy`.
 The chat endpoint does not use the scheduler yet.
 
+### Logging
+
+The broker writes one JSON object per line to stderr: `time`, `level`, `event`,
+then the event's facts. Events emitted while handling a request also carry its
+`request_id` and, with authentication on, its `client`, including events from a
+model load the request caused. Prompts, completions and keys are never logged.
+
+```json
+{"time": "2026-09-25T10:14:03.512+00:00", "level": "info", "event": "model_loaded", "request_id": "3f9c1a2b", "client": "vscode", "model": "qwen2.5-coder-7b-instruct-q4_k_m--cuda1", "seconds": 6.84}
+```
+
+`MODEL_BROKER_LOG_LEVEL` (default `INFO`) sets the detail:
+
+- `INFO`: startup, authentication, router problems found or cleared, each
+  unload and load (started, done, failed), refused requests, and each completed
+  request.
+- `DEBUG` adds each admission and finished request, each wait and its reason,
+  what llama.cpp reported about each model considered for unloading, every call
+  to the router, every request received, and `/health` checks.
+
+Every event is a dataclass in `model_broker/events.py`, which also sets its
+level; code emits events rather than writing messages.
+
 ### Authentication
 
 API keys are optional. Without `MODEL_BROKER_API_KEYS_FILE`, authentication is
@@ -57,7 +80,7 @@ Run locally with the project environment:
 ```sh
 MODEL_BROKER_PRESET_PATH=/path/to/models-preset.ini \
   uv run uvicorn --app-dir src --factory model_broker.application:create_app \
-  --host 127.0.0.1 --port 8000
+  --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
 The supplied [`.env.example`](.env.example) lists the current environment

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,15 @@ import pytest
 from model_broker.application import Settings, create_app
 from model_broker.auth import ApiKeysError
 from model_broker.catalogue import CatalogueError
+from model_broker.events import (
+    AuthenticationOff,
+    Event,
+    HealthChecked,
+    RequestCompleted,
+    RequestContext,
+    RequestReceived,
+    RouterCalled,
+)
 
 PRESET = Path(__file__).parent / "fixtures" / "models-preset.ini"
 SETTINGS = Settings("http://router.test", PRESET)
@@ -175,10 +186,10 @@ def test_without_keys_file_every_request_is_accepted(headers: dict[str, str]) ->
     assert chat(SETTINGS, headers).status_code == 501
 
 
-def test_authentication_off_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
-    """Running without keys is allowed, but startup says so."""
+def test_authentication_off_is_warned_about(events: Callable[[], list[Event]]) -> None:
+    """Running without keys is allowed, but startup warns about it."""
     broker_request(lambda client: client.get("/health"))
-    assert "authentication is off" in caplog.text
+    assert AuthenticationOff() in events()
 
 
 @pytest.mark.parametrize(
@@ -221,6 +232,61 @@ def test_invalid_keys_file_stops_startup(tmp_path: Path) -> None:
 
     with pytest.raises(ApiKeysError, match="shorter than 16"):
         broker_request(lambda client: client.get("/health"), settings=settings)
+
+
+# Logging
+
+
+def in_request(caplog: pytest.LogCaptureFixture) -> list[tuple[Event, RequestContext]]:
+    """Each event emitted while handling a broker request, with that request's context."""
+    found = ((getattr(r, "event", None), getattr(r, "request", None)) for r in caplog.records)
+    return [
+        (event, context)
+        for event, context in found
+        if isinstance(event, Event) and isinstance(context, RequestContext)
+    ]
+
+
+def test_each_request_is_logged_with_its_id_and_client(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broker request produces a received and a completed event, sharing one request ID.
+
+    With authentication on, the completed event carries the client's name. The name is
+    known only after authentication, so this shows that later events see it.
+    """
+    caplog.set_level(logging.DEBUG, logger="model_broker")
+    chat(replace(with_keys(tmp_path), log_level="DEBUG"), {"Authorization": f"Bearer {KEY}"})
+    (received, first), (completed, last) = [
+        (event, context)
+        for event, context in in_request(caplog)
+        if isinstance(event, RequestReceived | RequestCompleted)
+    ]
+
+    assert received == RequestReceived("POST", "/v1/chat/completions")
+    assert isinstance(completed, RequestCompleted) and completed.status == 501
+    assert first.request_id == last.request_id and last.client == "vscode"
+
+
+def test_health_checks_are_logged_quietly(events: Callable[[], list[Event]]) -> None:
+    """/health is a HealthChecked event at DEBUG, not an INFO RequestCompleted, so that a
+    health check every few seconds does not fill the log."""
+    broker_request(
+        lambda client: client.get("/health"), settings=replace(SETTINGS, log_level="DEBUG")
+    )
+
+    kinds = {type(event) for event in events()}
+    assert HealthChecked in kinds and RequestCompleted not in kinds
+
+
+def test_router_calls_are_logged(events: Callable[[], list[Event]]) -> None:
+    """Every call to the router is a RouterCalled event: startup reads /props and /models."""
+    broker_request(
+        lambda client: client.get("/health"), settings=replace(SETTINGS, log_level="DEBUG")
+    )
+
+    calls = [(e.method, e.path, e.status) for e in events() if isinstance(e, RouterCalled)]
+    assert calls[:2] == [("GET", "/props", 200), ("GET", "/models", 200)]
 
 
 # Settings
@@ -286,4 +352,23 @@ def test_settings_require_a_positive_load_timeout(monkeypatch: pytest.MonkeyPatc
     assert Settings.from_environment().load_timeout_seconds == 600.0
     monkeypatch.setenv("MODEL_BROKER_LOAD_TIMEOUT_SECONDS", "0")
     with pytest.raises(ValueError, match="must be positive"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(("value", "level"), [(None, "INFO"), ("debug", "DEBUG")])
+def test_settings_read_the_log_level(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, level: str
+) -> None:
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    if value is None:
+        monkeypatch.delenv("MODEL_BROKER_LOG_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_BROKER_LOG_LEVEL", value)
+    assert Settings.from_environment().log_level == level
+
+
+def test_settings_reject_an_unknown_log_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODEL_BROKER_PRESET_PATH", "/config/models-preset.ini")
+    monkeypatch.setenv("MODEL_BROKER_LOG_LEVEL", "chatty")
+    with pytest.raises(ValueError, match="must be one of DEBUG, INFO, WARNING, ERROR"):
         Settings.from_environment()

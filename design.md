@@ -181,7 +181,7 @@ Authentication is optional, so that existing clients keep working while they are
 
 A bearer key crossing the LAN in plain HTTP can be read by anyone on the network. The deployment will later put the broker behind the Caddy gateway, which terminates TLS; that needs no change to the broker.
 
-The broker emits structured JSON logs for preset validation, the startup check, load and unload transitions, scheduling decisions (admit, wait, refuse, and why), timeouts, request lifecycle summaries, and reconciliation. It never logs API keys, Authorization headers, prompts, completions, or streamed output.
+The broker emits structured JSON logs for preset validation, the startup check, load and unload transitions, scheduling decisions (admit, wait, refuse, and why), timeouts, request lifecycle summaries, and reconciliation. Each log line is a typed event: code emits event objects rather than writing messages, and each event's class sets its level. Events carry the ID of the broker request that caused them, and its client, including events from background loads. `MODEL_BROKER_LOG_LEVEL` sets the detail; `DEBUG` includes every router call and every observation behind a scheduling decision. It never logs API keys, Authorization headers, prompts, completions, or streamed output.
 
 ## Privileged host facts
 

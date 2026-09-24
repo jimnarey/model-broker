@@ -26,4 +26,5 @@ RUN groupadd --system model-broker \
 USER model-broker
 EXPOSE 8000
 
-CMD ["uvicorn", "--factory", "model_broker.application:create_app", "--host", "0.0.0.0", "--port", "8000"]
+# The broker logs each request itself, so uvicorn's access log would only duplicate it.
+CMD ["uvicorn", "--factory", "model_broker.application:create_app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

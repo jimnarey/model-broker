@@ -17,6 +17,25 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 
 from model_broker.catalogue import Variant, claims_conflict, max_loaded_models
+from model_broker.events import (
+    BaselineRecorded,
+    ModelAdopted,
+    ModelLoaded,
+    ModelLoadFailed,
+    ModelObserved,
+    ModelUnloaded,
+    ModelUnloadFailed,
+    ModelUnobservable,
+    RequestAdmitted,
+    RequestFinished,
+    RequestRefused,
+    RequestWaiting,
+    RouterProblemsCleared,
+    RouterProblemsFound,
+    SwapStarted,
+    emit,
+    snake_case,
+)
 from model_broker.llama import LlamaAdapter, LlamaError, ModelState, RouterProps
 
 # The router statuses the broker understands. Any status but "unloaded", including one the
@@ -223,10 +242,15 @@ class Scheduler:
         """Begin tracking the models adopted from the router."""
         await self.track(list(self.loaded.values()))
 
+    def seconds_since(self, started: float) -> float:
+        return round(self.clock() - started, 3)
+
     async def track(self, models: list[LoadedModel]) -> None:
         """Watch newly adopted models: wait for any still loading, and record a baseline
         decode count for the others."""
         for model in models:
+            state = "loaded" if model.ready.is_set() else "loading"
+            emit(ModelAdopted(model.variant.id, state))
             if model.ready.is_set():
                 await self.record_baseline(model)
             else:
@@ -240,12 +264,21 @@ class Scheduler:
     @asynccontextmanager
     async def admit(self, model_id: str) -> AsyncGenerator[Variant]:
         """Hold an admission to ``model_id`` for the duration of one proxied request."""
-        model = await self.acquire(model_id)
+        started = self.clock()
+        try:
+            model = await self.acquire(model_id)
+        except SchedulerError as error:
+            cause = snake_case(type(error).__name__)
+            emit(RequestRefused(model_id, cause, str(error), self.seconds_since(started)))
+            raise
+        emit(RequestAdmitted(model_id, self.seconds_since(started)))
+        admitted = self.clock()
         try:
             yield model.variant
         finally:
             model.active -= 1
             model.last_activity = self.clock()
+            emit(RequestFinished(model_id, self.seconds_since(admitted)))
             await self.notify()
 
     async def acquire(self, model_id: str) -> LoadedModel:
@@ -256,6 +289,7 @@ class Scheduler:
         deadline = self.clock() + self.max_wait_seconds
         ticket = Ticket(variant)
         self.waiting.append(ticket)
+        reported = ""
         try:
             while True:
                 model = self.loaded.get(model_id)
@@ -268,6 +302,9 @@ class Scheduler:
                 now = self.clock()
                 if placed.until is not None and placed.until <= now:
                     continue  # the obstacle has already gone; look again at once
+                if placed.reason != reported:
+                    emit(RequestWaiting(model_id, placed.reason))
+                    reported = placed.reason
                 if now >= deadline:
                     retry = placed.until - now if placed.until else BUSY_RETRY_AFTER_SECONDS
                     raise ResourceBusy(placed.reason, max(1, math.ceil(retry)))
@@ -302,6 +339,7 @@ class Scheduler:
             states = await self.adapter.model_states()
         except LlamaError as error:
             self.view.problems = [f"router is unavailable: {error}"]
+            emit(RouterProblemsFound(self.view.problems))
             return
         fresh, problems = reconcile(self.catalogue, states, self.clock())
         merged: dict[str, LoadedModel] = {}
@@ -318,6 +356,10 @@ class Scheduler:
         self.view = RouterView(
             merged, router_problems(props, self.catalogue) + problems, props.build
         )
+        if self.view.problems:
+            emit(RouterProblemsFound(self.view.problems))
+        else:
+            emit(RouterProblemsCleared(props.build))
         await self.track(new)
 
     async def join(self, model: LoadedModel) -> LoadedModel:
@@ -365,6 +407,7 @@ class Scheduler:
                 victim.leaving = True
             model = LoadedModel(variant, self.clock(), ready=ready_event(False))
             self.loaded[variant.id] = model
+            emit(SwapStarted(variant.id, [victim.variant.id for victim in conflicts]))
         self.background(self.swap(conflicts, model))
         return model
 
@@ -376,11 +419,16 @@ class Scheduler:
         loaded; the router was never asked to load it, so it holds nothing. ``model`` is
         marked ready either way, releasing its waiters.
         """
+        victim = None
         try:
             for victim in victims:
+                started = self.clock()
                 await self.adapter.unload(victim.variant.id)
                 del self.loaded[victim.variant.id]
+                emit(ModelUnloaded(victim.variant.id, self.seconds_since(started)))
         except LlamaError as error:
+            if victim is not None:
+                emit(ModelUnloadFailed(victim.variant.id, str(error)))
             for victim in victims:
                 victim.leaving = False
             del self.loaded[model.variant.id]
@@ -388,11 +436,13 @@ class Scheduler:
             model.ready.set()
             await self.notify()
             return
+        started = self.clock()
         try:
             await self.adapter.load(model.variant.id)
         except LlamaError as error:
             await self.load_failed(model, error)
         else:
+            emit(ModelLoaded(model.variant.id, self.seconds_since(started)))
             await self.record_baseline(model)
         finally:
             model.last_activity = self.clock()
@@ -401,11 +451,13 @@ class Scheduler:
 
     async def finish_load(self, model: LoadedModel) -> None:
         """Wait for an adopted model that the router is still loading."""
+        started = self.clock()
         try:
             await self.adapter.wait_for_state(model.variant.id, "loaded")
         except LlamaError as error:
             await self.load_failed(model, error)
         else:
+            emit(ModelLoaded(model.variant.id, self.seconds_since(started)))
             await self.record_baseline(model)
         finally:
             model.ready.set()
@@ -427,6 +479,7 @@ class Scheduler:
             unloaded = False
         else:
             unloaded = state is None or state.value == "unloaded"
+        emit(ModelLoadFailed(model_id, str(error), released=unloaded))
         if unloaded:
             if self.loaded.get(model_id) is model:
                 del self.loaded[model_id]
@@ -435,6 +488,7 @@ class Scheduler:
                 f"loading {model_id!r} failed ({error}), and the router has not confirmed it "
                 "is unloaded, so it keeps its resources until the router is checked again"
             )
+            emit(RouterProblemsFound(self.view.problems))
 
     async def record_baseline(self, model: LoadedModel) -> None:
         """Record the model's decode count, so later work bypassing the broker shows up.
@@ -444,6 +498,7 @@ class Scheduler:
         """
         with suppress(LlamaError):
             model.decode_calls = (await self.adapter.activity(model.variant.id)).decode_calls
+        emit(BaselineRecorded(model.variant.id, model.decode_calls))
 
     async def busy(self, conflicts: list[LoadedModel]) -> Blocked | None:
         """Return why a conflicting model cannot be unloaded yet, or None if all are idle."""
@@ -458,11 +513,18 @@ class Scheduler:
             try:
                 activity = await self.adapter.activity(name)
             except LlamaError as error:
+                emit(ModelUnobservable(name, str(error)))
                 return Blocked(f"cannot see whether {name!r} is idle: {error}")
             # Without a baseline, unseen work cannot be ruled out, so assume there was some.
-            if model.decode_calls is None or activity.decode_calls != model.decode_calls:
+            worked = model.decode_calls is None or activity.decode_calls != model.decode_calls
+            if worked:
                 model.last_activity = self.clock()
             model.decode_calls = activity.decode_calls
+            emit(
+                ModelObserved(
+                    name, activity.processing, activity.deferred, activity.decode_calls, worked
+                )
+            )
             if activity.processing or activity.deferred:
                 return Blocked(f"{name!r} is working or has requests queued in llama.cpp")
             protected_until = model.last_activity + self.protect_seconds
