@@ -494,16 +494,23 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def prepare_socket(path: Path, group: str) -> int:
-    """Remove a stale socket at path and return the group's ID; refuse to replace anything else."""
+    """Remove a stale socket at path, give the group its directory, and return the group's ID.
+
+    The broker container mounts the directory, not the socket file: a restart of this helper
+    replaces the socket, and a bind-mounted file would keep pointing at the old one. So the
+    group needs to be able to enter the directory. Refuses to replace anything but a socket."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
         if not path.is_socket():
             raise ValueError(f"refusing to replace non-socket path: {path}")
         path.unlink()
     try:
-        return grp.getgrnam(group).gr_gid
+        group_id = grp.getgrnam(group).gr_gid
     except KeyError as error:
         raise ValueError(f"socket group does not exist: {group}") from error
+    os.chown(path.parent, -1, group_id)
+    os.chmod(path.parent, 0o750)
+    return group_id
 
 
 def main() -> int:

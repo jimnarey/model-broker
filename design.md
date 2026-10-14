@@ -233,7 +233,7 @@ The broker emits structured JSON logs for preset validation, the startup check, 
 
 The broker runs unprivileged and is never given a Docker socket, root account, or permission to execute host commands. Host facts come from `model-broker-host-facts.py`, a small root-owned systemd service in this repository. It is an observation helper, not another broker: it makes no scheduling decisions, starts no applications, and has no model API.
 
-It exposes one Unix-domain socket, mounted only into the broker container, and accepts a fixed, versioned request set:
+It exposes one Unix-domain socket, whose directory (not the socket file, which is replaced whenever the helper restarts) is mounted only into the broker container, and accepts a fixed, versioned request set:
 
 | Request | Returned facts |
 | --- | --- |

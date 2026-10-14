@@ -429,6 +429,20 @@ def test_prepare_socket_removes_a_stale_socket(host_facts: Any, short_directory:
     assert not path.exists()
 
 
+def test_prepare_socket_gives_the_group_the_directory(host_facts: Any, tmp_path: Path) -> None:
+    """Preparing a socket path in a new directory makes the directory group-readable (0750).
+
+    The broker container mounts the directory, not the socket file, because a restart replaces
+    the file. A member of the client group can only reach the socket through a directory that
+    the group may enter, and the runtime directory systemd creates is root-only."""
+    directory = tmp_path / "run"
+
+    host_facts.prepare_socket(directory / "facts.sock", grp.getgrgid(os.getgid()).gr_name)
+
+    status = directory.stat()
+    assert (status.st_gid, oct(status.st_mode & 0o777)) == (os.getgid(), "0o750")
+
+
 def test_prepare_socket_rejects_unknown_group(host_facts: Any, tmp_path: Path) -> None:
     """A configured group must exist before the root helper creates its socket.
 

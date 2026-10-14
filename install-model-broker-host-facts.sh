@@ -33,4 +33,6 @@ systemctl daemon-reload
 systemctl enable --now model-broker-host-facts.service
 
 group_id=$(getent group model-broker-host-facts-client | cut -d: -f3)
-echo "Installed. Add this to the broker container with group_add: [$group_id]."
+echo "Installed. Give the broker container group_add: [$group_id] and mount the directory"
+echo "/run/model-broker-host-facts (not the socket file inside it, which is replaced"
+echo "whenever the helper restarts)."

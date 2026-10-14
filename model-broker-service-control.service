@@ -9,6 +9,9 @@ User=root
 Group=root
 RuntimeDirectory=model-broker-service-control
 RuntimeDirectoryMode=0750
+# Keep the directory when the unit restarts: the broker container mounts it, and a new
+# directory would leave that mount pointing at the deleted one.
+RuntimeDirectoryPreserve=yes
 StateDirectory=model-broker-service-control
 UMask=0077
 ExecStart=/usr/bin/python3 /usr/local/libexec/model-broker-service-control/model-broker-service-control.py --socket /run/model-broker-service-control/control.sock --socket-group model-broker-control-client --config /etc/model-broker/service-control.conf --state-directory /var/lib/model-broker-service-control

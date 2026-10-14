@@ -18,7 +18,8 @@ import pytest
 
 IMAGE = "model-broker-systemd-test:local"
 PROJECT = Path(__file__).parents[1].resolve()
-SOCKET = "/run/model-broker-host-facts/facts.sock"
+DIRECTORY = "/run/model-broker-host-facts"
+SOCKET = f"{DIRECTORY}/facts.sock"
 CTL = "/usr/local/libexec/model-broker-host-facts/model-broker-host-factsctl.py"
 
 Exec = Callable[..., subprocess.CompletedProcess[str]]
@@ -70,21 +71,25 @@ def test_clean_install_starts_the_service_and_serves_authorised_clients(containe
     """A clean install starts the helper and admits a client in its dedicated group.
 
     Setup: an otherwise empty systemd container runs the installer as root. The test then
-    creates an ordinary user in the socket's client group and bind-mounts the socket into
-    ``/tmp``. The mount models deployment: the broker container receives the socket itself,
-    not the root-owned runtime directory that contains it.
+    creates an ordinary user in the socket's client group and bind-mounts the runtime
+    *directory* into ``/mnt``. The mount models deployment: the broker container receives the
+    directory, not the socket file inside it, which the helper replaces whenever it restarts.
 
-    Expect: systemd reports the service active, the socket has the documented root, group, and
-    0660 permissions, and the ordinary group member can request both supported operations.
-    This checks the installed service's useful behaviour without creating or testing any legacy
-    supervisor or migration path.
+    Expect: systemd reports the service active, the directory and socket have the documented
+    root, group, and permissions (0750 and 0660), and the ordinary group member can request both
+    supported operations through the mount, which needs the group to be able to enter the
+    directory. This checks the installed service's useful behaviour without creating or testing
+    any legacy supervisor or migration path.
     """
     installed = container("bash", "/opt/model-broker/install-model-broker-host-facts.sh")
     assert installed.returncode == 0, installed.stderr
 
     assert container("systemctl", "is-active", "model-broker-host-facts.service").returncode == 0
-    ownership = container("stat", "--format=%U:%G:%a", SOCKET).stdout.strip()
-    assert ownership == "root:model-broker-host-facts-client:660"
+    ownership = container("stat", "--format=%U:%G:%a", DIRECTORY, SOCKET).stdout.split()
+    assert ownership == [
+        "root:model-broker-host-facts-client:750",
+        "root:model-broker-host-facts-client:660",
+    ]
     assert (
         container(
             "useradd",
@@ -95,24 +100,47 @@ def test_clean_install_starts_the_service_and_serves_authorised_clients(containe
         ).returncode
         == 0
     )
-    assert container("touch", "/tmp/facts.sock").returncode == 0
-    mounted = container("mount", "--bind", SOCKET, "/tmp/facts.sock")
+    assert container("mkdir", "-p", "/mnt/facts").returncode == 0
+    mounted = container("mount", "--bind", DIRECTORY, "/mnt/facts")
     assert mounted.returncode == 0, mounted.stderr
 
     for operation in ("inventory", "utilisation"):
-        response = container(
-            "runuser",
-            "--user",
-            "broker-client",
-            "--",
-            "python3",
-            CTL,
-            "--socket",
-            "/tmp/facts.sock",
-            operation,
-        )
+        response = ask_facts(container, operation)
         assert response.returncode == 0, response.stderr
         assert json.loads(response.stdout)["ok"] is True
+
+
+def ask_facts(container: Exec, operation: str) -> subprocess.CompletedProcess[str]:
+    """Send a host-facts request as the unprivileged group member, through the mount."""
+    return container(
+        "runuser", "--user", "broker-client", "--", "python3", CTL,
+        "--socket", "/mnt/facts/facts.sock", operation,
+    )  # fmt: skip
+
+
+def test_host_facts_restart_keeps_the_directory_the_broker_mounts(container: Exec) -> None:
+    """Restart the installed facts helper and check the broker's mount would still work.
+
+    Setup: install, mount the runtime directory as the broker container does, restart the unit,
+    then request the inventory through the old mount as the group member.
+
+    Expect the directory to keep its inode (systemd deletes a RuntimeDirectory on stop unless
+    told to preserve it) and the request through the old mount to succeed. Mounting the socket
+    file instead would fail here even with the directory kept, as the helper replaces the file."""
+    assert container("bash", "/opt/model-broker/install-model-broker-host-facts.sh").returncode == 0
+    container(
+        "useradd", "--create-home", "--groups", "model-broker-host-facts-client", "broker-client"
+    )
+    container("mkdir", "-p", "/mnt/facts")
+    assert container("mount", "--bind", DIRECTORY, "/mnt/facts").returncode == 0
+    before = container("stat", "--format=%i", DIRECTORY).stdout
+
+    restarted = container("systemctl", "restart", "model-broker-host-facts.service")
+    assert restarted.returncode == 0, restarted.stderr
+    after = container("stat", "--format=%i", DIRECTORY).stdout
+
+    response = ask_facts(container, "inventory")
+    assert (before == after, response.returncode) == (True, 0), response.stderr
 
 
 SERVICE_CONTROL_SOCKET = "/run/model-broker-service-control/control.sock"
@@ -185,3 +213,41 @@ def test_service_control_install_serves_authorised_clients_only(container: Exec)
     assert json.loads(member.stdout)["result"]["state"] == "missing"
     assert "not controlled" in ask("member", "other").stdout
     assert ask("outsider", "strata").returncode != 0
+
+
+def test_service_control_restart_keeps_the_directory_the_broker_mounts(container: Exec) -> None:
+    """Restart the installed helper and check the broker's mount would still work.
+
+    Setup: install as in the test above, bind-mount the runtime directory (as the broker
+    container does), restart the unit, then ask for a status through the mount.
+
+    Expect the directory to keep its inode across the restart (systemd deletes a
+    RuntimeDirectory on stop unless told to preserve it), and the request through the old mount
+    to succeed. With a new directory the mount would show the deleted one, empty, and the
+    broker could not reach the helper again without being restarted itself."""
+    container(
+        "bash",
+        "-c",
+        "mkdir -p /etc/model-broker /srv && touch /srv/compose.yml"
+        " && printf '#!/bin/sh\\nexit 0\\n' > /usr/bin/docker && chmod 755 /usr/bin/docker"
+        f" && cat > /etc/model-broker/service-control.conf <<'EOF'\n{SERVICE_CONTROL_CONFIG}EOF",
+    )
+    assert (
+        container("bash", "/opt/model-broker/install-model-broker-service-control.sh").returncode
+        == 0
+    )
+    container("mkdir", "-p", "/mnt/control")
+    assert (
+        container("mount", "--bind", "/run/model-broker-service-control", "/mnt/control").returncode
+        == 0
+    )
+    before = container("stat", "--format=%i", "/run/model-broker-service-control").stdout
+
+    restarted = container("systemctl", "restart", "model-broker-service-control.service")
+    assert restarted.returncode == 0, restarted.stderr
+    after = container("stat", "--format=%i", "/run/model-broker-service-control").stdout
+
+    status = container(
+        "python3", SERVICE_CONTROL_CTL, "--socket", "/mnt/control/control.sock", "status", "strata"
+    )
+    assert (before == after, status.returncode) == (True, 0), status.stderr

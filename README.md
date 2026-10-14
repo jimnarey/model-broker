@@ -219,8 +219,11 @@ CUDA driver API; it never shells out to `nvidia-smi`.
 Socket access is the control boundary. The socket is owned by root and the
 dedicated `model-broker-host-facts-client` group with mode `0660`; the service
 also checks Linux peer credentials (including supplementary groups) for each
-connection. Mount only this socket into the broker container. There is no
-HMAC key or Docker socket to mount.
+connection. Mount only this socket's directory into the broker container, not
+the socket file: the helper replaces the socket when it restarts, and a mounted
+file would keep pointing at the old one (the unit keeps the directory across
+restarts, and the helper gives the client group access to it). There is no HMAC
+key or Docker socket to mount.
 
 Install manually on the host after reviewing the unit:
 
@@ -241,7 +244,7 @@ deployment that enables optional host facts should use:
 group_add:
   - "${MODEL_BROKER_HOST_FACTS_GID}"
 volumes:
-  - /run/model-broker-host-facts/facts.sock:/run/model-broker-host-facts/facts.sock
+  - /run/model-broker-host-facts:/run/model-broker-host-facts
 environment:
   MODEL_BROKER_HOST_FACTS_SOCKET: /run/model-broker-host-facts/facts.sock
 ```

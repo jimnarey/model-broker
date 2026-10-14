@@ -8,6 +8,9 @@ User=root
 Group=root
 RuntimeDirectory=model-broker-host-facts
 RuntimeDirectoryMode=0750
+# Keep the directory when the unit restarts: the broker container mounts it, and a new
+# directory would leave that mount pointing at the deleted one.
+RuntimeDirectoryPreserve=yes
 UMask=0077
 ExecStart=/usr/bin/python3 /usr/local/libexec/model-broker-host-facts/model-broker-host-facts.py --socket /run/model-broker-host-facts/facts.sock --socket-group model-broker-host-facts-client
 Restart=on-failure
