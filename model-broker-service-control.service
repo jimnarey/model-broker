@@ -1,0 +1,30 @@
+[Unit]
+Description=Start and stop configured Compose services for model-broker
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=model-broker-service-control
+RuntimeDirectoryMode=0750
+StateDirectory=model-broker-service-control
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/libexec/model-broker-service-control/model-broker-service-control.py --socket /run/model-broker-service-control/control.sock --socket-group model-broker-control-client --config /etc/model-broker/service-control.conf --state-directory /var/lib/model-broker-service-control
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/run/model-broker-service-control /var/lib/model-broker-service-control
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

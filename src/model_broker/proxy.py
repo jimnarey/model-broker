@@ -12,8 +12,9 @@ import httpx
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
+from model_broker.backend import Backend
 from model_broker.events import ClientDisconnected, ProxyFailed, ProxyFinished, emit
-from model_broker.llama import LlamaAdapter, LlamaError
+from model_broker.llama import BackendError
 
 # Headers not relayed: those describing the router's connection rather than the response,
 # and content-encoding, because the body is relayed decoded.
@@ -50,7 +51,7 @@ class ProxiedChat(Response):
 
     def __init__(
         self,
-        adapter: LlamaAdapter,
+        adapter: Backend,
         payload: Mapping[str, object],
         model: str,
         resources: AsyncExitStack,
@@ -92,7 +93,7 @@ class ProxiedChat(Response):
             upstream = await self.resources.enter_async_context(
                 self.adapter.chat_completions(self.payload)
             )
-        except LlamaError as error:
+        except BackendError as error:
             emit(ProxyFailed(self.model, str(error)))
             body = openai_error_body(str(error), "server_error", "router_unavailable")
             self.finishing = True

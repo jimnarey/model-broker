@@ -117,7 +117,7 @@ def inspect(handler: httpx.MockTransport) -> tuple[list[str], list[str], str | N
 
     async def main() -> tuple[list[str], list[str], str | None]:
         async with httpx.AsyncClient(transport=handler, base_url="http://router.test") as client:
-            view = await inspect_router(LlamaAdapter(client), CATALOGUE, NOW)
+            view = await inspect_router({"llama": LlamaAdapter(client)}, CATALOGUE, NOW)
         return sorted(view.loaded), view.problems, view.build
 
     return asyncio.run(main())

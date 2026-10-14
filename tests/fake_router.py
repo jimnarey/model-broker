@@ -21,6 +21,7 @@ CUDA0 = "qwen2.5-coder-7b-instruct-q4_k_m--cuda0"
 CUDA1 = "qwen2.5-coder-7b-instruct-q4_k_m--cuda1"
 MOE_CUDA1 = "GLM-4.5-Air-UD-Q4_K_XL--cuda1"
 DUAL = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0--cuda0-cuda1"
+CPU = "Qwen3.5-9B-Q4_K_M--cpu"
 GOOD_PROPS = {"role": "router", "max_instances": 3, "models_autoload": False, "build_info": "b1"}
 
 

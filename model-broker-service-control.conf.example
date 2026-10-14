@@ -1,0 +1,30 @@
+# Services the broker may start and stop, installed as /etc/model-broker/service-control.conf.
+#
+# This file decides what the helper can touch, so keep it root-owned and not writable by
+# anyone else. A request can name only a service listed here, and can set only the
+# environment variables listed for it. Compose interpolates those into the service, so
+# they choose a model or a context, not an image, mount, command or device.
+
+[control]
+# Defaults for every service. Absolute paths.
+docker = /usr/bin/docker
+compose-file = /home/ai/server_containers/docker-compose.yml
+project-directory = /home/ai/server_containers
+# The Compose project name, as in the com.docker.compose.project label of its containers.
+project-name = server_containers
+# Seconds a start (which may recreate the container) or a stop may take.
+start-timeout-seconds = 180
+stop-timeout-seconds = 180
+
+# One section per controllable Compose service. The section name is the service's name in
+# the Compose file, unless compose-service says otherwise. compose-file, project-directory
+# and project-name may be overridden per service.
+[strata]
+# Seconds Docker waits for the container to exit before killing it.
+stop-grace-seconds = 60
+# The variables a start may set; a request naming any other is refused. These are the
+# names compose.ai.yml passes to Strata's entrypoint.
+allowed-env = STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_KV STRATA_VISION STRATA_LOW_RAM STRATA_SPEED_PROJECTION
+
+# Another service needs only a section, plus allowed-env if it takes settings:
+# [comfyui]

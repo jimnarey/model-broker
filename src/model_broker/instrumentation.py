@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 import httpx
@@ -90,19 +91,21 @@ async def note_start(request: httpx.Request) -> None:
     request.extensions[STARTED] = time.monotonic()
 
 
-async def report_call(response: httpx.Response) -> None:
-    request = response.request
-    started = cast(float, request.extensions.get(STARTED, time.monotonic()))
-    emit(
-        RouterCalled(
-            request.method,
-            request.url.path,
-            requested_model(request),
-            response.status_code,
-            seconds_since(started),
+def router_event_hooks(backend: str) -> dict[str, list[Callable[..., Awaitable[None]]]]:
+    """httpx event hooks for a model server's client: one ``RouterCalled`` event per call."""
+
+    async def report_call(response: httpx.Response) -> None:
+        request = response.request
+        started = cast(float, request.extensions.get(STARTED, time.monotonic()))
+        emit(
+            RouterCalled(
+                request.method,
+                request.url.path,
+                requested_model(request),
+                response.status_code,
+                seconds_since(started),
+                backend,
+            )
         )
-    )
 
-
-ROUTER_EVENT_HOOKS = {"request": [note_start], "response": [report_call]}
-"""httpx event hooks for the router client: one ``RouterCalled`` event per call."""
+    return {"request": [note_start], "response": [report_call]}

@@ -1,4 +1,4 @@
-"""Small HTTP boundary for one already-running llama.cpp router."""
+"""Small HTTP boundary for one already-running llama.cpp router, or a server with its API."""
 
 from __future__ import annotations
 
@@ -11,27 +11,16 @@ from typing import cast
 
 import httpx
 
+from model_broker.backend import BackendError, ModelActivity, ModelState, RouterProps
+
 JsonObject = dict[str, object]
 # Prompt processing on a long context can take minutes before the first byte, and a stream
 # can pause between tokens, so inference has no read limit; connecting still has one.
 INFERENCE_TIMEOUT = httpx.Timeout(10.0, read=None)
 
 
-class LlamaError(RuntimeError):
-    """The attached llama.cpp router could not complete a broker operation."""
-
-
-@dataclass(frozen=True, slots=True)
-class ModelState:
-    """One model's router status.
-
-    ``value`` is ``unloaded``, ``loading``, ``loaded`` or ``sleeping``. A failed load is
-    reported as ``unloaded`` with ``failed`` set and the worker's exit code.
-    """
-
-    value: str
-    failed: bool = False
-    exit_code: int | None = None
+class LlamaError(BackendError):
+    """The llama.cpp router could not complete a broker operation."""
 
 
 def parse_model_states(document: object) -> dict[str, ModelState]:
@@ -59,42 +48,20 @@ def parse_model_states(document: object) -> dict[str, ModelState]:
     return states
 
 
-@dataclass(frozen=True, slots=True)
-class RouterProps:
-    """The router settings the broker depends on, from ``GET /props``."""
-
-    max_instances: int
-    models_autoload: bool
-    build: str | None
-
-
-def parse_router_props(document: object) -> RouterProps:
+def parse_router_props(document: object, role: str = "router") -> RouterProps:
+    """Validate a ``GET /props`` document from a server whose ``role`` is as given."""
     props = cast(JsonObject, document) if isinstance(document, dict) else {}
     max_instances, autoload, build = (
         props.get("max_instances"),
         props.get("models_autoload"),
         props.get("build_info"),
     )
-    if props.get("role") != "router":
-        raise LlamaError("GET /props did not come from a llama.cpp router (role is not 'router')")
+    if props.get("role") != role:
+        raise LlamaError(f"GET /props did not come from a {role} (its role is not {role!r})")
     # type() rather than isinstance(), because JSON true is also a Python int.
     if type(max_instances) is not int or type(autoload) is not bool:
         raise LlamaError("router GET /props response has invalid max_instances or autoload")
     return RouterProps(max_instances, autoload, build if isinstance(build, str) else None)
-
-
-@dataclass(frozen=True, slots=True)
-class ModelActivity:
-    """What a loaded model's server reports it is doing.
-
-    ``decode_calls`` counts llama_decode() calls. It rises while the model processes a prompt
-    or generates, whereas the token counters only change when a request finishes, so a
-    change between two observations shows the model worked in between.
-    """
-
-    processing: bool
-    deferred: int
-    decode_calls: int
 
 
 def parse_prometheus(text: str) -> dict[str, float]:
@@ -136,12 +103,18 @@ class LlamaAdapter:
     ``client`` is long-lived, owned by the caller, and has the router URL as its base URL;
     its timeout bounds the control requests. The adapter owns no scheduling policy and never
     relies on llama.cpp's autoload.
+
+    The model-management API (``/props``, ``/models``, ``/models/load``, ``/models/unload``)
+    is also served by Strata's supervisor, so this adapter drives it too, with ``role`` set
+    to what that server's ``/props`` reports. ``name`` is how errors refer to the server.
     """
 
     client: httpx.AsyncClient
     state_timeout_seconds: float = 60.0
     poll_interval_seconds: float = 0.1
     inference_timeout: httpx.Timeout = field(default_factory=lambda: INFERENCE_TIMEOUT)
+    name: str = "router"
+    role: str = "router"
 
     def __post_init__(self) -> None:
         # "not >" rather than "<=" so that NaN is rejected too.
@@ -156,7 +129,7 @@ class LlamaAdapter:
             response = await self.client.get(path, params=params)
             response.raise_for_status()
         except httpx.HTTPError as error:
-            raise LlamaError(f"router GET {path} failed: {error}") from error
+            raise LlamaError(f"{self.name} GET {path} failed: {error}") from error
         return response
 
     async def get_json(self, path: str, **params: str) -> object:
@@ -164,10 +137,10 @@ class LlamaAdapter:
         try:
             return cast(object, response.json())
         except ValueError as error:
-            raise LlamaError(f"router GET {path} failed: response is not JSON") from error
+            raise LlamaError(f"{self.name} GET {path} failed: response is not JSON") from error
 
     async def props(self) -> RouterProps:
-        return parse_router_props(await self.get_json("/props"))
+        return parse_router_props(await self.get_json("/props"), self.role)
 
     async def activity(self, model_id: str) -> ModelActivity:
         """Read a loaded model's slots and metrics. The router needs ``--metrics``."""
@@ -181,21 +154,21 @@ class LlamaAdapter:
     async def model_state(self, model_id: str) -> ModelState:
         state = (await self.model_states()).get(model_id)
         if state is None:
-            raise LlamaError(f"router does not list model {model_id!r}")
+            raise LlamaError(f"{self.name} does not list model {model_id!r}")
         return state
 
     async def post_model(self, action: str, model_id: str) -> httpx.Response:
         try:
             return await self.client.post(f"/models/{action}", json={"model": model_id})
         except httpx.HTTPError as error:
-            raise LlamaError(f"router POST /models/{action} failed: {error}") from error
+            raise LlamaError(f"{self.name} POST /models/{action} failed: {error}") from error
 
     async def load(self, model_id: str) -> None:
         """Explicitly load a model and wait until it is loaded, failing fast if its load fails."""
         response = await self.post_model("load", model_id)
         if response.is_error:
             raise LlamaError(
-                f"router refused to load {model_id!r}: {response.status_code} {response.text}"
+                f"{self.name} refused to load {model_id!r}: {response.status_code} {response.text}"
             )
         await self.wait_for_state(model_id, "loaded")
 
@@ -210,7 +183,8 @@ class LlamaAdapter:
             if (await self.model_state(model_id)).value == "unloaded":
                 return
             raise LlamaError(
-                f"router refused to unload {model_id!r}: {response.status_code} {response.text}"
+                f"{self.name} refused to unload {model_id!r}: "
+                f"{response.status_code} {response.text}"
             )
         await self.wait_for_state(model_id, "unloaded")
 
@@ -221,13 +195,13 @@ class LlamaAdapter:
             state = await self.model_state(model_id)
             if state.failed:
                 raise LlamaError(
-                    f"router model {model_id!r} failed to load (exit code {state.exit_code})"
+                    f"{self.name} model {model_id!r} failed to load (exit code {state.exit_code})"
                 )
             if state.value == expected:
                 return
             if time.monotonic() >= deadline:
                 raise LlamaError(
-                    f"router model {model_id!r} did not become {expected!r} within "
+                    f"{self.name} model {model_id!r} did not become {expected!r} within "
                     f"{self.state_timeout_seconds:g}s; last state was {state.value!r}"
                 )
             await asyncio.sleep(self.poll_interval_seconds)
@@ -252,4 +226,4 @@ class LlamaAdapter:
             ) as response:
                 yield response
         except httpx.HTTPError as error:
-            raise LlamaError(f"router POST /v1/chat/completions failed: {error}") from error
+            raise LlamaError(f"{self.name} POST /v1/chat/completions failed: {error}") from error

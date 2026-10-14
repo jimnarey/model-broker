@@ -15,6 +15,11 @@ CUDA_NUMBER = r"(?:0|[1-9][0-9]*)"
 CUDA_DEVICE = re.compile(rf"CUDA{CUDA_NUMBER}")
 CUDA_SUFFIX = re.compile(rf"--(cuda{CUDA_NUMBER}(?:-cuda{CUDA_NUMBER})*)$")
 CPU_SUFFIX = "--cpu"
+SERVICE_KEYS = frozenset({"service", "device", "exclusive"})
+SERVICE_ENV_PREFIX = "env."
+SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+RESOURCE_NAME = re.compile(r"[A-Za-z0-9:_-]+")
 # llama.cpp accepts either spelling for the draft model's devices; it defaults to ``device``.
 DRAFT_DEVICE_KEYS = ("spec-draft-device", "device-draft")
 GPU_ONLY_KEYS = frozenset({"n-cpu-moe", "split-mode", "main-gpu", "tensor-split"})
@@ -45,6 +50,15 @@ class Variant:
     settings: Mapping[str, str] = field(hash=False)
     claims: tuple[ResourceClaim, ...]
     resource_class: str
+    # Which server loads and serves it: "llama" (the router), or the name of a service
+    # started and stopped by restarting its container, such as "strata".
+    backend: str = "llama"
+    # The environment variables a restart-managed service's container is started with.
+    env: Mapping[str, str] = field(default_factory=lambda: no_env(), hash=False)
+
+
+def no_env() -> Mapping[str, str]:
+    return MappingProxyType({})
 
 
 def invalid(variant_id: str, problem: str) -> CatalogueError:
@@ -182,8 +196,9 @@ def preset_header(lines: list[str]) -> dict[str, str]:
     return header
 
 
-def parse_catalogue(text: str) -> dict[str, Variant]:
-    """Parse a llama.cpp preset, materialise ``[*]`` defaults, and validate every variant."""
+def read_preset(text: str, keep_case: bool = False) -> configparser.ConfigParser:
+    """Parse a preset's version header and sections, as llama.cpp's and the services' both have
+    them. Option names are lowercased unless ``keep_case``, which environment variables need."""
     lines = text.splitlines()
     first_section = next(
         (number for number, line in enumerate(lines) if line.lstrip().startswith("[")),
@@ -196,6 +211,8 @@ def parse_catalogue(text: str) -> dict[str, Variant]:
             f"settings; found {header}"
         )
     parser = configparser.ConfigParser(interpolation=None)
+    if keep_case:
+        parser.optionxform = str  # type: ignore[assignment,method-assign]
     try:
         # Blank lines replace the header so that configparser reports true line numbers.
         parser.read_string("\n" * first_section + "\n".join(lines[first_section:]))
@@ -203,7 +220,12 @@ def parse_catalogue(text: str) -> dict[str, Variant]:
         raise CatalogueError(f"invalid preset: {error}") from error
     if parser.defaults():
         raise CatalogueError("[DEFAULT] is not supported; use [*] for shared llama settings")
+    return parser
 
+
+def parse_catalogue(text: str) -> dict[str, Variant]:
+    """Parse a llama.cpp preset, materialise ``[*]`` defaults, and validate every variant."""
+    parser = read_preset(text)
     defaults = dict(parser.items("*", raw=True)) if parser.has_section("*") else {}
     variants = {
         section: variant(section, defaults | dict(parser.items(section, raw=True)))
@@ -215,12 +237,96 @@ def parse_catalogue(text: str) -> dict[str, Variant]:
     return variants
 
 
+def service_variant(variant_id: str, settings: Mapping[str, str]) -> Variant:
+    """Validate one section of a restart-managed service's preset.
+
+    The section names the service, the GPUs it holds (the suffix, confirmed by ``device``),
+    any other resources it holds exclusively, and the environment variables its container is
+    started with. Its GPUs and those resources are exclusive; CPU is recorded.
+    """
+    unknown = sorted(
+        key
+        for key in settings
+        if key not in SERVICE_KEYS and not key.startswith(SERVICE_ENV_PREFIX)
+    )
+    if unknown:
+        raise invalid(variant_id, f"has unknown setting {unknown[0]!r}")
+    service = settings.get("service", "")
+    if SERVICE_NAME.fullmatch(service) is None:
+        raise invalid(variant_id, f"has an invalid or missing service {service!r}")
+    devices = suffix_devices(variant_id)
+    configured = setting_devices(variant_id, "device", settings.get("device"))
+    if configured != devices:
+        raise invalid(
+            variant_id,
+            f"suffix requires {devices or ('none',)}, but device is {configured or ('none',)}",
+        )
+    env = {
+        key.removeprefix(SERVICE_ENV_PREFIX): value
+        for key, value in settings.items()
+        if key.startswith(SERVICE_ENV_PREFIX)
+    }
+    bad = sorted(name for name in env if ENV_NAME.fullmatch(name) is None)
+    if bad:
+        raise invalid(variant_id, f"has an invalid environment variable name {bad[0]!r}")
+    extra = settings.get("exclusive", "").replace(",", " ").split()
+    if any(RESOURCE_NAME.fullmatch(resource) is None for resource in extra):
+        raise invalid(variant_id, f"has an invalid exclusive resource in {extra}")
+    exclusive = {f"GPU{device[4:]}" for device in devices} | set(extra)
+    claims = tuple(ResourceClaim(resource, exclusive=True) for resource in sorted(exclusive))
+    if "CPU" not in exclusive:
+        claims = (ResourceClaim("CPU", exclusive=False), *claims)
+    return Variant(
+        id=variant_id,
+        model_path=f"service:{service}",
+        settings=MappingProxyType(dict(settings)),
+        claims=claims,
+        resource_class="service",
+        backend=service,
+        env=MappingProxyType(env),
+    )
+
+
+def parse_service_catalogue(text: str) -> dict[str, Variant]:
+    """Parse a preset of restart-managed services, which has no ``[*]`` defaults: each section
+    is complete."""
+    parser = read_preset(text, keep_case=True)
+    if parser.has_section("*"):
+        raise CatalogueError("[*] is not supported in a service preset; each section is complete")
+    variants = {
+        section: service_variant(section, dict(parser.items(section, raw=True)))
+        for section in parser.sections()
+    }
+    if not variants:
+        raise CatalogueError("service preset has no model sections")
+    return variants
+
+
 def load_catalogue(path: Path) -> dict[str, Variant]:
     """Read a mounted preset file and turn it into a validated catalogue."""
     try:
         return parse_catalogue(path.read_text(encoding="utf-8"))
     except OSError as error:
         raise CatalogueError(f"could not read preset {path}: {error}") from error
+
+
+def load_service_catalogue(path: Path) -> dict[str, Variant]:
+    """Read a mounted service preset file and turn it into a validated catalogue."""
+    try:
+        return parse_service_catalogue(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise CatalogueError(f"could not read service preset {path}: {error}") from error
+
+
+def merge_catalogues(*catalogues: Mapping[str, Variant]) -> dict[str, Variant]:
+    """Combine catalogues, refusing a model ID that two of them define."""
+    merged: dict[str, Variant] = {}
+    for catalogue in catalogues:
+        for model_id, item in catalogue.items():
+            if model_id in merged:
+                raise CatalogueError(f"model {model_id!r} is defined in more than one preset")
+            merged[model_id] = item
+    return merged
 
 
 def managed_resources(variants: Mapping[str, Variant]) -> frozenset[str]:

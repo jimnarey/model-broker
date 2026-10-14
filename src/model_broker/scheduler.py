@@ -16,6 +16,7 @@ from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 
+from model_broker.backend import Backend, BackendError, ModelState, RouterProps
 from model_broker.catalogue import Variant, claims_conflict, max_loaded_models
 from model_broker.events import (
     BaselineRecorded,
@@ -36,7 +37,6 @@ from model_broker.events import (
     emit,
     snake_case,
 )
-from model_broker.llama import LlamaAdapter, LlamaError, ModelState, RouterProps
 
 # The router statuses the broker understands. Any status but "unloaded", including one the
 # broker does not know, is taken to hold the model's resources.
@@ -131,8 +131,10 @@ class Ticket:
     variant: Variant
 
 
-def router_problems(props: RouterProps, catalogue: Mapping[str, Variant]) -> list[str]:
-    """Check the router settings the design depends on.
+def router_problems(
+    props: RouterProps, catalogue: Mapping[str, Variant], name: str = "router"
+) -> list[str]:
+    """Check the settings of a server (named ``name``) that the design depends on.
 
     ``models-max`` must never force the router to choose a model to unload, so it must allow
     as many models as can be loaded without conflict. llama.cpp uses 0 for unlimited.
@@ -141,16 +143,19 @@ def router_problems(props: RouterProps, catalogue: Mapping[str, Variant]) -> lis
     needed = max_loaded_models(catalogue)
     if 0 < props.max_instances < needed:
         problems.append(
-            f"router models-max is {props.max_instances}, but {needed} models can be loaded "
+            f"{name} models-max is {props.max_instances}, but {needed} models can be loaded "
             f"together; set --models-max {needed} or higher"
         )
     if props.models_autoload:
-        problems.append("router loads models automatically; start it with --no-models-autoload")
+        problems.append(f"{name} loads models automatically; start it with --no-models-autoload")
     return problems
 
 
 def reconcile(
-    catalogue: Mapping[str, Variant], states: Mapping[str, ModelState], now: float
+    catalogue: Mapping[str, Variant],
+    states: Mapping[str, ModelState],
+    now: float,
+    name: str = "router",
 ) -> tuple[dict[str, LoadedModel], list[str]]:
     """Adopt the models the router holds, recording problems that make scheduling unsafe.
 
@@ -158,7 +163,7 @@ def reconcile(
     ``loading`` is not ready. Adopted models start with last activity ``now``, so the idle
     protection window applies after a broker restart. A status the broker does not know, a
     loaded model outside the catalogue (its claims are unknown), and two conflicting loaded
-    models (which the broker never allows) are problems.
+    models (which the broker never allows) are problems. ``name`` is the server they came from.
     """
     loaded: dict[str, LoadedModel] = {}
     problems: list[str] = []
@@ -167,37 +172,87 @@ def reconcile(
             continue
         if state.value not in KNOWN_STATES:
             problems.append(
-                f"router reports {model_id!r} in unknown state {state.value!r}; it is taken "
+                f"{name} reports {model_id!r} in unknown state {state.value!r}; it is taken "
                 "to hold its resources"
             )
         if state.value == "sleeping":
-            problems.append(f"router reports {model_id!r} sleeping; idle sleeping must be off")
+            problems.append(f"{name} reports {model_id!r} sleeping; idle sleeping must be off")
         variant = catalogue.get(model_id)
         if variant is None:
-            problems.append(f"router has {model_id!r} {state.value}, but the preset lacks it")
+            problems.append(f"{name} has {model_id!r} {state.value}, but the preset lacks it")
         else:
             ready = ready_event(state.value != "loading")
             loaded[model_id] = LoadedModel(variant, last_activity=now, ready=ready)
     for first, second in itertools.combinations(loaded.values(), 2):
         if claims_conflict(first.variant, second.variant):
             problems.append(
-                f"router has conflicting models loaded: {first.variant.id!r} and "
+                f"{name} has conflicting models loaded: {first.variant.id!r} and "
                 f"{second.variant.id!r}"
             )
     return loaded, problems
 
 
+def cross_backend_conflicts(loaded: Mapping[str, LoadedModel]) -> list[str]:
+    """Report loaded models on different servers that claim the same resource.
+
+    Each server's own models are checked by ``reconcile``; only the broker can see these.
+    """
+    return [
+        f"conflicting models are loaded on different servers: {first.variant.id!r} and "
+        f"{second.variant.id!r}"
+        for first, second in itertools.combinations(loaded.values(), 2)
+        if first.variant.backend != second.variant.backend
+        and claims_conflict(first.variant, second.variant)
+    ]
+
+
+@dataclass(slots=True)
+class Survey:
+    """What every server reported: the models adopted, and why scheduling is unsafe.
+
+    ``unreachable`` holds the backends that could not be read, whose models are therefore
+    unknown rather than unloaded.
+    """
+
+    loaded: dict[str, LoadedModel]
+    problems: list[str]
+    build: str | None
+    unreachable: set[str]
+
+
+async def survey(
+    adapters: Mapping[str, Backend], catalogue: Mapping[str, Variant], now: float
+) -> Survey:
+    """Read the settings and loaded models of every server, each against its own models.
+
+    The build reported is the first reachable server's, which is the llama.cpp router's.
+    """
+    loaded: dict[str, LoadedModel] = {}
+    problems: list[str] = []
+    unreachable: set[str] = set()
+    build: str | None = None
+    for key, adapter in adapters.items():
+        own = {model_id: item for model_id, item in catalogue.items() if item.backend == key}
+        try:
+            props = await adapter.props()
+            states = await adapter.model_states()
+        except BackendError as error:
+            unreachable.add(key)
+            problems.append(f"{adapter.name} is unavailable: {error}")
+            continue
+        found, found_problems = reconcile(own, states, now, adapter.name)
+        loaded |= found
+        problems += router_problems(props, own, adapter.name) + found_problems
+        build = build or props.build
+    return Survey(loaded, problems + cross_backend_conflicts(loaded), build, unreachable)
+
+
 async def inspect_router(
-    adapter: LlamaAdapter, catalogue: Mapping[str, Variant], now: float
+    adapters: Mapping[str, Backend], catalogue: Mapping[str, Variant], now: float
 ) -> RouterView:
-    """Check the router's settings and adopt its loaded models."""
-    try:
-        props = await adapter.props()
-        states = await adapter.model_states()
-    except LlamaError as error:
-        return RouterView(loaded={}, problems=[f"router is unavailable: {error}"], build=None)
-    loaded, problems = reconcile(catalogue, states, now)
-    return RouterView(loaded, router_problems(props, catalogue) + problems, props.build)
+    """Check the servers' settings and adopt their loaded models."""
+    found = await survey(adapters, catalogue, now)
+    return RouterView(found.loaded, found.problems, found.build)
 
 
 class Scheduler:
@@ -213,7 +268,7 @@ class Scheduler:
 
     def __init__(
         self,
-        adapter: LlamaAdapter,
+        adapters: Mapping[str, Backend],
         catalogue: Mapping[str, Variant],
         view: RouterView,
         *,
@@ -222,7 +277,10 @@ class Scheduler:
         poll_seconds: float = POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.adapter = adapter
+        missing = {item.backend for item in catalogue.values()} - adapters.keys()
+        if missing:
+            raise ValueError(f"no server is configured for the backends {sorted(missing)}")
+        self.adapters = adapters
         self.catalogue = catalogue
         self.view = view
         self.protect_seconds = protect_seconds
@@ -241,6 +299,9 @@ class Scheduler:
     async def start(self) -> None:
         """Begin tracking the models adopted from the router."""
         await self.track(list(self.loaded.values()))
+
+    def backend_for(self, variant: Variant) -> Backend:
+        return self.adapters[variant.backend]
 
     def seconds_since(self, started: float) -> float:
         return round(self.clock() - started, 3)
@@ -326,40 +387,33 @@ class Scheduler:
             raise RouterUnfit(self.view.problems)
 
     async def reinspect(self) -> None:
-        """Check the router again, merging what it reports with the models already tracked.
+        """Check the servers again, merging what they report with the models already tracked.
 
         Problems can arise while other models are serving requests, so the existing record
-        of each model the router still holds is kept, with its active and queued counts. A
-        record is replaced only if its load failed. A model the router no longer holds is
-        dropped, unless a request or an unload or load is still in progress on it. If the
-        router cannot be reached, nothing is known, so every tracked model is kept.
+        of each model a server still holds is kept, with its active and queued counts. A
+        record is replaced only if its load failed. A model a server no longer holds is
+        dropped, unless a request or an unload or load is still in progress on it. If a
+        server cannot be reached, its models are unknown, so every one tracked is kept.
         """
-        try:
-            props = await self.adapter.props()
-            states = await self.adapter.model_states()
-        except LlamaError as error:
-            self.view.problems = [f"router is unavailable: {error}"]
-            emit(RouterProblemsFound(self.view.problems))
-            return
-        fresh, problems = reconcile(self.catalogue, states, self.clock())
+        found = await survey(self.adapters, self.catalogue, self.clock())
         merged: dict[str, LoadedModel] = {}
-        for model_id, adopted in fresh.items():
+        for model_id, adopted in found.loaded.items():
             current = self.loaded.get(model_id)
             merged[model_id] = current if current and current.error is None else adopted
         for model_id, current in self.loaded.items():
             in_progress = current.active or current.leaving or not current.ready.is_set()
-            if model_id not in merged and in_progress:
+            unknown = current.variant.backend in found.unreachable
+            if model_id not in merged and (in_progress or unknown):
                 merged[model_id] = current
         new = [
             model for model_id, model in merged.items() if self.loaded.get(model_id) is not model
         ]
-        self.view = RouterView(
-            merged, router_problems(props, self.catalogue) + problems, props.build
-        )
+        build = found.build or self.view.build
+        self.view = RouterView(merged, found.problems, build)
         if self.view.problems:
             emit(RouterProblemsFound(self.view.problems))
         else:
-            emit(RouterProblemsCleared(props.build))
+            emit(RouterProblemsCleared(build))
         await self.track(new)
 
     async def join(self, model: LoadedModel) -> LoadedModel:
@@ -423,10 +477,10 @@ class Scheduler:
         try:
             for victim in victims:
                 started = self.clock()
-                await self.adapter.unload(victim.variant.id)
+                await self.backend_for(victim.variant).unload(victim.variant.id)
                 del self.loaded[victim.variant.id]
                 emit(ModelUnloaded(victim.variant.id, self.seconds_since(started)))
-        except LlamaError as error:
+        except BackendError as error:
             if victim is not None:
                 emit(ModelUnloadFailed(victim.variant.id, str(error)))
             for victim in victims:
@@ -438,8 +492,8 @@ class Scheduler:
             return
         started = self.clock()
         try:
-            await self.adapter.load(model.variant.id)
-        except LlamaError as error:
+            await self.backend_for(model.variant).load(model.variant.id)
+        except BackendError as error:
             await self.load_failed(model, error)
         else:
             emit(ModelLoaded(model.variant.id, self.seconds_since(started)))
@@ -453,8 +507,8 @@ class Scheduler:
         """Wait for an adopted model that the router is still loading."""
         started = self.clock()
         try:
-            await self.adapter.wait_for_state(model.variant.id, "loaded")
-        except LlamaError as error:
+            await self.backend_for(model.variant).wait_for_state(model.variant.id, "loaded")
+        except BackendError as error:
             await self.load_failed(model, error)
         else:
             emit(ModelLoaded(model.variant.id, self.seconds_since(started)))
@@ -463,7 +517,7 @@ class Scheduler:
             model.ready.set()
             await self.notify()
 
-    async def load_failed(self, model: LoadedModel, error: LlamaError) -> None:
+    async def load_failed(self, model: LoadedModel, error: BackendError) -> None:
         """Record a failed load, releasing the model's resources only if that is certain.
 
         A timeout or a lost connection does not show that the worker has gone: it may still
@@ -474,8 +528,8 @@ class Scheduler:
         model_id = model.variant.id
         model.error = str(error)
         try:
-            state = (await self.adapter.model_states()).get(model_id)
-        except LlamaError:
+            state = (await self.backend_for(model.variant).model_states()).get(model_id)
+        except BackendError:
             unloaded = False
         else:
             unloaded = state is None or state.value == "unloaded"
@@ -496,8 +550,10 @@ class Scheduler:
         If it cannot be read, the count stays unknown and the next observation counts as
         recent activity.
         """
-        with suppress(LlamaError):
-            model.decode_calls = (await self.adapter.activity(model.variant.id)).decode_calls
+        with suppress(BackendError):
+            model.decode_calls = (
+                await self.backend_for(model.variant).activity(model.variant.id)
+            ).decode_calls
         emit(BaselineRecorded(model.variant.id, model.decode_calls))
 
     async def busy(self, conflicts: list[LoadedModel]) -> Blocked | None:
@@ -511,8 +567,9 @@ class Scheduler:
             if model.active or model.queued or not model.ready.is_set():
                 return Blocked(f"{name!r} is loading, working, or has requests waiting")
             try:
-                activity = await self.adapter.activity(name)
-            except LlamaError as error:
+                backend = self.backend_for(model.variant)
+                activity = await backend.activity(name)
+            except BackendError as error:
                 emit(ModelUnobservable(name, str(error)))
                 return Blocked(f"cannot see whether {name!r} is idle: {error}")
             # Without a baseline, unseen work cannot be ruled out, so assume there was some.
@@ -526,7 +583,8 @@ class Scheduler:
                 )
             )
             if activity.processing or activity.deferred:
-                return Blocked(f"{name!r} is working or has requests queued in llama.cpp")
+                server = "llama.cpp" if model.variant.backend == "llama" else backend.name
+                return Blocked(f"{name!r} is working or has requests queued in {server}")
             protected_until = model.last_activity + self.protect_seconds
             if protected_until > until:
                 until, reason = protected_until, f"{name!r} was used recently"

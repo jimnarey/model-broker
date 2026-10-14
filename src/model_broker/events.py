@@ -337,9 +337,21 @@ class RequestFailed(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class ServiceControlCalled(Event):
+    """One request from the broker to the host's service-control helper, which starts and
+    stops a service's container. ``error`` is set when the request failed."""
+
+    level = logging.DEBUG
+    operation: str
+    service: str
+    seconds: float
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RouterCalled(Event):
-    """One HTTP call from the broker to the router; for a stream, ``seconds`` is the time
-    to the response headers."""
+    """One HTTP call from the broker to a model server (``backend`` is ``llama`` or
+    ``strata``); for a stream, ``seconds`` is the time to the response headers."""
 
     level = logging.DEBUG
     method: str
@@ -347,3 +359,4 @@ class RouterCalled(Event):
     model: str | None
     status: int
     seconds: float
+    backend: str = "llama"

@@ -1,6 +1,7 @@
 # Model broker
 
-An OpenAI-compatible broker in front of one llama.cpp router. It decides which
+An OpenAI-compatible broker in front of one llama.cpp router, and optionally
+services such as Strata that change model by restarting. It decides which
 models can be loaded together on this host's GPUs and RAM, loads and unloads
 them explicitly, and proxies chat requests, so that a request for one model
 does not needlessly unload another on a different GPU. See [the design](design.md).
@@ -64,8 +65,62 @@ request, so llama.cpp stops generating, and releases the model at once.
 | `MODEL_BROKER_LOAD_TIMEOUT_SECONDS` | `600` | How long a load or unload may take. |
 | `MODEL_BROKER_API_KEYS_FILE` | unset (off) | API keys; see Authentication. |
 | `MODEL_BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+| `MODEL_BROKER_SERVICE_PRESET_PATH` | unset (none) | Preset of services started by restarting a container (Strata); naming it turns them on. |
+| `MODEL_BROKER_SERVICE_CONTROL_SOCKET` | `/run/model-broker-service-control/control.sock` | The service-control helper's socket. |
+| `MODEL_BROKER_SERVICE_LOAD_TIMEOUT_SECONDS` | `3600` | How long such a model may take to start. |
+| `MODEL_BROKER_STRATA_URL` | `http://strata:8080` | Strata's own API, which serves the model. |
+| `MODEL_BROKER_STRATA_API_KEY` | unset | Strata's API key, if it has one. |
 
 [`.env.example`](.env.example) describes each one.
+
+### Services that change model by restarting
+
+Some servers choose their model when they start and cannot change it while running.
+Strata is one: it serves a single model per process, so it cannot join the llama.cpp
+router. For these the broker changes model by stopping or starting the service's
+container, which it cannot do itself because it has no Docker access. A second host
+service, [`model-broker-service-control`](#service-control), does it on request.
+
+Naming a service preset with `MODEL_BROKER_SERVICE_PRESET_PATH` adds the service's models
+to `/v1/models`. The preset has the llama preset's layout (`version = 1`, one section per
+model, the `--cuda<N>` suffix). Each section names the `service`, its `device`, any other
+`exclusive` resources (Strata holds `RAM:weights`), and the environment variables its
+container is started with as `env.NAME` keys. The broker needs no other knowledge of the
+service's image: `strata/config/models-preset.ini` in the server-containers repository is an
+example. Loading a model starts the container with that
+section's settings; unloading stops it. The model currently loaded is read from the settings
+the running container was created with, and it counts as loaded once the service's own API
+answers. A model whose container exits while starting fails at once, with its exit code.
+
+Every model of such a service claims its GPUs and listed resources exclusively, so loading one
+unloads whatever competes for them, on either server, and the reverse. Strata's own API serves
+the chat requests and reports whether it is busy. If a configured service cannot be reached,
+meaning the helper is down, the broker stops scheduling everything until it can, because it
+cannot tell what that service holds. Leave the setting unset when no such service is in use.
+
+#### Service control
+
+`model-broker-service-control.py` is a small root-owned systemd service, installed with
+`sudo ./install-model-broker-service-control.sh`, next to the read-only host-facts helper but
+with a different job: it starts and stops Docker Compose services. It is not a general Docker
+API. A root-owned configuration (`/etc/model-broker/service-control.conf`, from
+[the example](model-broker-service-control.conf.example)) lists the services it may touch, each
+with the Compose project it belongs to and the environment variables a start may set. A
+request can only name a listed service and set a listed variable to a value of plain
+characters; nothing else in it reaches a command line, and Compose runs with a scrubbed
+environment, `--no-build` and `--pull never`. Any service in the Compose project can be added
+to the configuration, with or without settings.
+
+It serves a versioned JSON protocol (`status`, `start`, `stop`) on a Unix socket owned by the
+group `model-broker-control-client`. Give the broker container that group (`group_add`) and
+mount the directory `/run/model-broker-service-control`, not the socket file: the helper
+replaces the socket when it restarts, and a mounted file would keep pointing at the old one.
+`model-broker-service-controlctl.py` sends a request by hand:
+
+```sh
+python3 /usr/local/libexec/model-broker-service-control/model-broker-service-controlctl.py \
+  status strata
+```
 
 ### Logging
 
@@ -85,7 +140,7 @@ model load the request caused. Prompts, completions and keys are never logged.
   request.
 - `DEBUG` adds each admission and finished request, each wait and its reason,
   what llama.cpp reported about each model considered for unloading, every call
-  to the router, every request received, and `/health` checks.
+  to a model server, every request received, and `/health` checks.
 
 Every event is a dataclass in `model_broker/events.py`, which also sets its
 level; code emits events rather than writing messages.

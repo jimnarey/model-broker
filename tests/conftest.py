@@ -12,12 +12,26 @@ import pytest
 from model_broker.events import Event
 
 HOST_FACTS_SCRIPT = Path(__file__).parents[1] / "model-broker-host-facts.py"
+SERVICE_CONTROL_SCRIPT = Path(__file__).parents[1] / "model-broker-service-control.py"
 
 
 @pytest.fixture(scope="session")
 def host_facts() -> Any:
     """Load the standalone host-facts script, whose file name is not importable, as a module."""
     spec = importlib.util.spec_from_file_location("model_broker_host_facts", HOST_FACTS_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="session")
+def service_control() -> Any:
+    """Load the standalone service-control script, which is not importable by name, as a module."""
+    spec = importlib.util.spec_from_file_location(
+        "model_broker_service_control", SERVICE_CONTROL_SCRIPT
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

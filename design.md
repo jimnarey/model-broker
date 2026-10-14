@@ -6,13 +6,13 @@ The broker is a standalone Python service that exposes an OpenAI-compatible API,
 
 The broker exists because the router cannot make that decision. The router's model limit is a global process count: it does not know that a GPU1 model and a GPU0 model can stay loaded together, or that a request for another GPU1 model should make only the GPU1 worker a candidate for unloading. Its request order and LRU behaviour are therefore not a scheduling policy for this host. The broker owns the set of loaded models and makes every load and unload decision explicitly.
 
-The router runs in Docker as the `llama-cpp` Compose service. Docker starts it normally and keeps it running; the broker never calls Docker, Compose, systemd, or a host-side supervisor.
+The router runs in Docker as the `llama-cpp` Compose service. Docker starts it normally and keeps it running, and the broker never starts or stops it. The broker itself never calls Docker, Compose or systemd. For services that can only change model by restarting, it asks a small host service to start or stop a named Compose service (see Service control); that is the one place it causes a container to start or stop.
 
 **Network assumption:** the router is on a private network that only the broker can reach, so every request to it passes through the broker. The deployment provides that network.
 
 The deployment in the server-containers repository supplies the unified llama.cpp preset. The broker only needs a readable path to that file; it does not need that repository, Compose files, model directories, or GPU devices. It is deliberately based on upstream llama.cpp. Experimental MoE forks remain available for benchmarking but are not on the broker path.
 
-The broker schedules only llama.cpp, and it is written directly against the llama.cpp router, with no adapter abstraction. If another significant-compute application, such as ComfyUI or Ollama, is later brought under the broker, the boundary will be extracted from the working llama.cpp code at that point. Until then, those applications' GPU use is outside the broker's accounting and can still cause out-of-memory failures.
+The broker schedules the llama.cpp router and, optionally, services that change model by restarting their container, of which Strata is the first. Both sit behind one small `Backend` interface, extracted from the working llama.cpp code when Strata arrived: load, unload, status, activity, and chat forwarding. Other significant-compute applications, such as ComfyUI or Ollama, are not under the broker. Their GPU use is outside its accounting and can still cause out-of-memory failures; bringing one in means adding a backend, and for one that must be restarted, a section in the service preset and in the helper's configuration.
 
 ## Standalone configuration
 
@@ -114,6 +114,50 @@ POST /v1/chat/completions            proxied inference, including SSE streams
 
 After a load or unload the broker polls `GET /models` until the desired state is reported, or until a bounded timeout. Status values are `unloaded`, `loading`, `loaded`, and `sleeping`. The pinned router reports a failed load as `unloaded` with `failed: true` and the worker's exit code, so the broker fails the load as soon as it sees that. Unloading a model that is not running returns 400; the broker treats it as done when `GET /models` confirms the model is unloaded. A chat request for an unloaded model returns 400 "model is not loaded" rather than starting a worker: the broker is the only component that loads models.
 
+## Services that change model by restarting
+
+Strata runs a large MoE model by spreading its experts over GPU, RAM and SSD. It serves exactly one model per process, fixed at start, and its server has no API to change it. (Later versions can unload and reload that same model, which is not enough.) It therefore cannot be driven like the llama.cpp router. The same goes for other servers that choose their model at start, so the broker has a general backend for them, `ManagedService`, and Strata is the first service on it.
+
+Changing model means stopping or starting the service's container, and the broker has no Docker access. A second host service does it, described under Service control below. The broker asks it to start the container with a model's settings, or to stop it. The container is the unit of loading: the model is loaded when the container runs and the service's own API answers, and unloaded when it has stopped.
+
+### The service preset
+
+A service preset has the llama preset's layout (`version = 1`, `;` comments, one self-contained section per model, a `--cuda<N>` or `--cpu` suffix) and is mounted read-only into the broker, which names it with an optional environment variable: with none, no service is configured. A section holds:
+
+- `service`: which service it is. The broker needs a client for it (today only `strata`); an unknown service stops startup.
+- `device`: the GPUs, matching the suffix, as for llama.cpp.
+- `exclusive`: resources besides the GPUs that no other model may hold while it is loaded. Strata copies its experts into RAM, so it holds `RAM:weights`, which conflicts with llama.cpp's CPU-weight and expert-offload models.
+- `env.NAME`: each environment variable the container is started with. Every section lists all of them, empty ones too, because the container is recreated with exactly these and an empty value overrides whatever `.env` sets.
+
+Nothing else is accepted: a section is the broker's whole description of what to start. The uncensored Strata model is the plain model's section with a control-vector path in `env.STRATA_SPEED_PROJECTION`; the two are separate models because they behave differently, though they share weights.
+
+A service's models claim their GPUs and listed resources exclusively and record CPU, so two models of one service conflict, as they must, and a service model conflicts with a llama.cpp model on its GPU or holding `RAM:weights`. A llama.cpp model on another GPU can stay loaded. Public model IDs must be unique across presets.
+
+### Loading, unloading and what is loaded
+
+The settings a container was created with say which model it runs: the model whose `env` all matches. So the broker learns what is loaded at startup by asking the helper for the container's status, with no state of its own. A running container whose settings match no section is reported as an unrecognised model, loaded and holding its resources, which the existing check turns into a problem that stops scheduling.
+
+A model is `loading` while its container runs but the service's API does not answer, `loaded` once it does, and `unloaded` when the container is stopped. Loading starts the container and waits; unloading stops it and waits. Both refuse to act on a different model from the one running (a start would recreate the container and kill the request it is serving), which the scheduler never asks for, so reaching it means the broker's picture is wrong. If the container exits while the broker waits for it to load, the load fails at once with the exit code rather than at the timeout. After a stop Docker reports the exit code of a killed container, 137, so an exit code says nothing about a stop that was requested.
+
+For Strata the broker reads activity from Strata's own `GET /v1/status`: `in_flight` (the running request and those queued) plays the part of llama.cpp's processing and deferred counts, and `requests` (finished plus running) the part of the decode counter, so work that reached Strata without the broker is noticed in the same way. Chat requests go to the same server unchanged. Strata ignores the model name in a request and answers with whatever it runs, which is safe because the scheduler admits a request only while the model it names is the loaded one. An API key set on Strata is sent as a bearer token.
+
+A Strata start is slow: its first start builds the engine (15 to 40 minutes) and every start reads tens of GB into RAM. `MODEL_BROKER_SERVICE_LOAD_TIMEOUT_SECONDS` (default an hour) replaces the load timeout for such services.
+
+If a service cannot be reached, meaning its helper is down, that is a problem that stops all scheduling, not only the service's models. The broker cannot tell what an unreachable service holds, and although a request for a llama.cpp model on the other GPU might be fine, there is no way to know that the GPU is free. Leave the service unconfigured when it is not in use. Startup also reports two servers holding conflicting models, which only the broker can see.
+
+### Service control
+
+`model-broker-service-control.py` is a root-owned systemd service in this repository, beside the host-facts helper but with the opposite character: that one only reads, this one starts and stops containers, so it is root-equivalent on the host and is built to do very little. It is not a general Docker API:
+
+- It has three requests, `status`, `start` and `stop`, in a versioned JSON protocol over a Unix socket, each naming a service. The socket's group, checked against the peer's credentials, decides who may ask.
+- It controls only the Docker Compose services in its root-owned configuration, each in the Compose project that file names, and can control any service in the project. It runs `docker compose up --detach --no-deps --no-build --pull never`, or `stop`, so it never builds, pulls, removes or touches other services.
+- A start can set only the environment variables the configuration allows for that service, to values of plain characters (empty is allowed). Compose interpolates them into the service, so the broker can choose a model or a context but not an image, mount, command or device. No request text becomes part of a command line other than the configured Compose service name.
+- Compose runs in an empty environment apart from `PATH` and a private Docker configuration directory, with a time limit, so nothing the helper inherited steers it.
+- Stopping uses `compose stop`, which keeps the container, so `restart: unless-stopped` does not bring it back. Starting an existing container with unchanged settings does nothing; changed settings make Compose recreate it.
+- Requests are served on threads, so a slow stop does not hold up the status polls the broker makes while a model unloads. Mutations are serialised per service.
+
+The helper reports a container's Docker state, its exit code once stopped, whether it was killed for want of memory, and the allowed settings it was created with. The broker container mounts the helper's runtime directory and joins its client group; it never receives the Docker socket.
+
 ## Public API and server
 
 The broker, rather than llama.cpp, serves the public API. It is an ASGI application implemented with FastAPI and served by Uvicorn.
@@ -202,7 +246,7 @@ The helper is implemented, but the broker does not consume it yet; see Deferred 
 
 ## Testing
 
-Unit tests run the real scheduler, adapter, and application against an in-memory fake router, with short real timings, and cover the scheduling rules, failures, proxying, authentication, and logging.
+Unit tests run the real scheduler, adapters, and application against an in-memory fake router and fake Strata, with short real timings, and cover the scheduling rules, failures, proxying, authentication, and logging. The service-control helper is tested with a stub `docker` that records its arguments and environment, and the broker's client against the real helper server; an opt-in systemd container test checks a clean install. Both were also run once against real Docker Compose with a throwaway project, which is not repeatable in CI.
 
 Acceptance tests prove the broker, over HTTP, against a real llama.cpp router on the GPUs, checking the router's own view of what is loaded and working. The router image is built in this repository from a pinned llama.cpp commit (kept at the commit the deployment runs), so the tests share no build files or configuration with server-containers. The tests take the preset and the models directory from the environment, choose the smallest suitable models from the preset, and run a fresh broker process per test. They are opt-in and need both GPUs idle.
 
@@ -239,5 +283,5 @@ This needs an end-to-end acceptance test against the pinned router and unified p
 - A measured CPU, RAM, and VRAM capacity policy, including whether mixed MoE expert-offload and CPU-weight workloads are worthwhile.
 - Broker integration of the host-facts helper, first for observation only.
 - Additional OpenAI endpoints, each added deliberately as described under Public API.
-- Coordination with ComfyUI, Ollama, or other GPU users, extracting an application boundary at that point.
+- Coordination with ComfyUI, Ollama, or other GPU users, each added as a backend like Strata.
 - Benchmarking and, only if justified, reintroducing a maintained MoE fork for a named variant.

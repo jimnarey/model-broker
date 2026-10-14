@@ -56,9 +56,9 @@ def run(
         transport = httpx.MockTransport(router.handle)
         async with httpx.AsyncClient(transport=transport, base_url="http://router.test") as client:
             adapter = LlamaAdapter(client, load_timeout, poll_interval_seconds=0.005)
-            view = await inspect_router(adapter, CATALOGUE, time.monotonic())
+            view = await inspect_router({"llama": adapter}, CATALOGUE, time.monotonic())
             scheduler = Scheduler(
-                adapter,
+                {"llama": adapter},
                 CATALOGUE,
                 view,
                 protect_seconds=protect,

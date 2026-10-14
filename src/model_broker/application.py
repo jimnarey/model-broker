@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +19,13 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from model_broker.auth import ApiKeys, client_for, load_api_keys
-from model_broker.catalogue import Variant, load_catalogue
+from model_broker.backend import Backend
+from model_broker.catalogue import (
+    Variant,
+    load_catalogue,
+    load_service_catalogue,
+    merge_catalogues,
+)
 from model_broker.events import (
     LEVELS,
     REQUEST,
@@ -30,7 +36,7 @@ from model_broker.events import (
     configure_logging,
     emit,
 )
-from model_broker.instrumentation import ROUTER_EVENT_HOOKS, RequestEvents
+from model_broker.instrumentation import RequestEvents, router_event_hooks
 from model_broker.llama import LlamaAdapter
 from model_broker.proxy import ProxiedChat
 from model_broker.scheduler import (
@@ -41,10 +47,16 @@ from model_broker.scheduler import (
     UnknownModel,
     inspect_router,
 )
+from model_broker.servicecontrol import ServiceControl, ServiceController
+from model_broker.strata import STRATA_SERVICE, strata_service
 
 # Bounds each router control and observation request; inference has its own timeout.
 ROUTER_TIMEOUT_SECONDS = 10.0
+# One request to the service-control helper, which may recreate a container or wait for one
+# to stop. The helper limits itself to 180 s by default, so this is longer.
+SERVICE_CONTROL_TIMEOUT_SECONDS = 300.0
 KEYS_FILE = "MODEL_BROKER_API_KEYS_FILE"
+SERVICE_PRESET = "MODEL_BROKER_SERVICE_PRESET_PATH"
 JsonObject = dict[str, object]
 
 
@@ -79,6 +91,17 @@ class Settings:
     api_keys_file: Path | None = None
     # DEBUG adds every admission, wait, observation, router call and broker request.
     log_level: str = "INFO"
+    # Services that change model by restarting their container (Strata) are optional: they
+    # are used only when their preset is named. The host's service-control helper restarts
+    # them, over its Unix socket.
+    service_preset_path: Path | None = None
+    service_control_socket: Path = Path("/run/model-broker-service-control/control.sock")
+    # A service can take far longer to start than a llama.cpp model: Strata's first start
+    # builds its engine (15-40 minutes) and every start reads tens of GB into RAM.
+    service_load_timeout_seconds: float = 3600.0
+    # Strata's own API, which serves the model, and its API key if it has one (a bearer token).
+    strata_url: str = "http://strata:8080"
+    strata_api_key: str | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -96,6 +119,20 @@ class Settings:
             ),
             api_keys_file=Path(keys_file) if (keys_file := os.environ.get(KEYS_FILE)) else None,
             log_level=log_level_setting(),
+            service_preset_path=Path(preset)
+            if (preset := os.environ.get(SERVICE_PRESET))
+            else None,
+            service_control_socket=Path(
+                os.environ.get(
+                    "MODEL_BROKER_SERVICE_CONTROL_SOCKET",
+                    "/run/model-broker-service-control/control.sock",
+                )
+            ),
+            service_load_timeout_seconds=seconds_setting(
+                "MODEL_BROKER_SERVICE_LOAD_TIMEOUT_SECONDS", 3600.0, positive=True
+            ),
+            strata_url=os.environ.get("MODEL_BROKER_STRATA_URL", "http://strata:8080").rstrip("/"),
+            strata_api_key=os.environ.get("MODEL_BROKER_STRATA_API_KEY") or None,
         )
 
 
@@ -186,13 +223,17 @@ async def health(request: Request) -> JsonObject:
     """Report the catalogue, the models the router holds, and why the broker cannot schedule."""
     scheduler = cast(Scheduler, request.app.state.scheduler)
     view = scheduler.view
-    return {
+    report: JsonObject = {
         "status": "degraded" if view.problems else "ok",
         "models": len(scheduler.catalogue),
         "loaded": sorted(view.loaded),
         "router": {"build": view.build, "problems": view.problems},
         "authentication": "off" if request.app.state.api_keys is None else "on",
     }
+    services = sorted(set(scheduler.adapters) - {"llama"})
+    if services:
+        report["services"] = services
+    return report
 
 
 def model_object(variant: Variant, created: int) -> JsonObject:
@@ -236,16 +277,56 @@ async def chat_completions(request: Request) -> ProxiedChat | JSONResponse:
     scheduler = cast(Scheduler, request.app.state.scheduler)
     resources = AsyncExitStack()
     try:
-        await resources.enter_async_context(scheduler.admit(model))
+        variant = await resources.enter_async_context(scheduler.admit(model))
     except SchedulerError as error:
         return refusal(error, model)
-    return ProxiedChat(scheduler.adapter, cast(JsonObject, payload), model, resources)
+    return ProxiedChat(scheduler.backend_for(variant), cast(JsonObject, payload), model, resources)
+
+
+async def open_service_api(
+    clients: AsyncExitStack,
+    open_client: Callable[..., httpx.AsyncClient],
+    name: str,
+    settings: Settings,
+) -> LlamaAdapter:
+    """Connect to the API of a restart-managed service, which serves its model and says
+    whether it is ready and busy."""
+    if name != STRATA_SERVICE:
+        raise ValueError(f"the preset names service {name!r}, which the broker has no client for")
+    key = settings.strata_api_key
+    client = await clients.enter_async_context(
+        open_client(
+            settings.strata_url,
+            name,
+            ROUTER_TIMEOUT_SECONDS,
+            {"Authorization": f"Bearer {key}"} if key else None,
+        )
+    )
+    return LlamaAdapter(client, name="Strata")
+
+
+def service_backend(
+    name: str,
+    catalogue: Mapping[str, Variant],
+    api: LlamaAdapter,
+    settings: Settings,
+    control: ServiceController | None,
+) -> Backend:
+    """The backend for the preset's models of one restart-managed service.
+
+    ``control`` is the client of the host's service-control helper, which tests replace."""
+    models = {model_id: item.env for model_id, item in catalogue.items() if item.backend == name}
+    control = control or ServiceControl(
+        settings.service_control_socket, SERVICE_CONTROL_TIMEOUT_SECONDS
+    )
+    return strata_service(control, models, api, settings.service_load_timeout_seconds)
 
 
 def create_app(
     settings: Settings | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], float] = time.monotonic,
+    service_control: ServiceController | None = None,
 ) -> FastAPI:
     """Create the broker API. Paths the broker does not serve return 404.
 
@@ -258,24 +339,42 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         catalogue = load_catalogue(configured.preset_path)
+        if configured.service_preset_path is not None:
+            services = load_service_catalogue(configured.service_preset_path)
+            catalogue = merge_catalogues(catalogue, services)
         if configured.api_keys_file is None:
             app.state.api_keys = None
             emit(AuthenticationOff())
         else:
             app.state.api_keys = load_api_keys(configured.api_keys_file)
             emit(AuthenticationOn(len(app.state.api_keys)))
-        async with httpx.AsyncClient(
-            base_url=configured.llama_url,
-            timeout=ROUTER_TIMEOUT_SECONDS,
-            transport=transport,
-            event_hooks=ROUTER_EVENT_HOOKS,
-        ) as client:
-            adapter = LlamaAdapter(client, state_timeout_seconds=configured.load_timeout_seconds)
-            view = await inspect_router(adapter, catalogue, clock())
+        async with AsyncExitStack() as clients:
+
+            def open_client(
+                url: str, backend: str, timeout: float, headers: dict[str, str] | None = None
+            ) -> httpx.AsyncClient:
+                return httpx.AsyncClient(
+                    base_url=url,
+                    timeout=timeout,
+                    headers=headers,
+                    transport=transport,
+                    event_hooks=router_event_hooks(backend),
+                )
+
+            llama = await clients.enter_async_context(
+                open_client(configured.llama_url, "llama", ROUTER_TIMEOUT_SECONDS)
+            )
+            adapters: dict[str, Backend] = {
+                "llama": LlamaAdapter(llama, state_timeout_seconds=configured.load_timeout_seconds)
+            }
+            for name in sorted({item.backend for item in catalogue.values()} - {"llama"}):
+                api = await open_service_api(clients, open_client, name, configured)
+                adapters[name] = service_backend(name, catalogue, api, configured, service_control)
+            view = await inspect_router(adapters, catalogue, clock())
             if view.problems:
                 emit(RouterProblemsFound(view.problems))
             app.state.scheduler = Scheduler(
-                adapter,
+                adapters,
                 catalogue,
                 view,
                 protect_seconds=configured.idle_protect_seconds,
