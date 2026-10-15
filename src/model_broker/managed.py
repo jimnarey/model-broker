@@ -145,12 +145,27 @@ class ManagedService:
                 return
             if expected == "loaded" and status.state in FAILED_STATES:
                 raise BackendError(self.failure(model_id, status))
+            if expected == "loaded" and status.occupying and self.identify(status) != model_id:
+                raise BackendError(self.mismatch(model_id, status))
             if time.monotonic() >= deadline:
                 raise BackendError(
                     f"{self.name} model {model_id!r} did not become {expected!r} within "
                     f"{self.state_timeout_seconds:g}s; last state was {state.value!r}"
                 )
             await asyncio.sleep(self.poll_interval_seconds)
+
+    def mismatch(self, model_id: str, status: ServiceStatus) -> str:
+        """Why a container that should be running this model is not recognised as it."""
+        differing = [
+            f"{name} (wanted {value!r}, found {status.settings.get(name)!r})"
+            for name, value in self.models[model_id].items()
+            if status.settings.get(name) != value
+        ]
+        return (
+            f"{self.name} is running, but its container does not have model {model_id!r}'s "
+            f"settings: {', '.join(differing)}. Is each variable passed through in the "
+            "Compose file?"
+        )
 
     def failure(self, model_id: str, status: ServiceStatus) -> str:
         how = (

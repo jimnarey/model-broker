@@ -348,6 +348,32 @@ def test_load_fails_at_once_if_the_container_stops() -> None:
     run_service(strata, body, timeout=60)
 
 
+def test_load_fails_at_once_if_the_container_lacks_the_models_settings() -> None:
+    """Load a model against a container that comes up without STRATA_KV, as when the Compose
+    file does not pass that variable through.
+
+    Setup: the fake drops one setting from what it was started with. Expect BackendError naming
+    the missing variable, promptly. Without the check the container would sit there running,
+    never recognised as the model, and the broker would wait out the whole load timeout."""
+    strata = FakeStrata()
+    original_start = strata.start
+
+    async def start_without_kv(service: str, settings: Any) -> Any:
+        return await original_start(
+            service, {k: v for k, v in settings.items() if k != "STRATA_KV"}
+        )
+
+    strata.start = start_without_kv  # type: ignore[method-assign]
+
+    async def body(service: ManagedService) -> None:
+        started = time.monotonic()
+        with pytest.raises(BackendError, match=r"STRATA_KV \(wanted 'int8', found None\)"):
+            await service.load(PLAIN)
+        assert time.monotonic() - started < 2
+
+    run_service(strata, body, timeout=60)
+
+
 def test_load_times_out_if_strata_never_answers() -> None:
     """Load with a 0.3 s timeout and a Strata that never becomes ready. Expect BackendError
     saying the model did not become loaded and that it was `loading` at the end."""
